@@ -26,6 +26,7 @@ data class UiState(
     val facePresent: Boolean = false,
     val eventsToday: Int = 0,
     val alertActive: Boolean = false,
+    val previewBitmap: android.graphics.Bitmap? = null,
 )
 
 class MonitorViewModel(
@@ -36,6 +37,8 @@ class MonitorViewModel(
     private val stateMachine: DriverStateMachine = DriverStateMachine(fatigue.thresholds),
     private val metrics: PerformanceMetrics = PerformanceMetrics(),
     private val locationProvider: LocationProvider? = null,
+    private val deviceBaseUrl: String? = null,
+    private val deviceNetwork: android.net.Network? = null,
     private val deviceId: String = app.getSharedPreferences("drowsy", 0).getString("device_id", null) ?: run {
         val id = "DEV-${java.util.UUID.randomUUID().toString().take(8)}"
         app.getSharedPreferences("drowsy", 0).edit().putString("device_id", id).apply(); id
@@ -59,13 +62,20 @@ class MonitorViewModel(
         job = viewModelScope.launch {
             camera.frames().collect { frame ->
                 metrics.onFrameReceived()
+                // Copy before handing to perception: MediaPipe's BitmapImageBuilder can recycle
+                // the source bitmap once it's done with it, which would crash Compose's Image
+                // if it tried to draw the same (now-recycled) object afterward.
+                val previewBmp = try {
+                    frame.bitmap.copy(frame.bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888, false)
+                } catch (_: Exception) { null }
                 val t0 = System.currentTimeMillis()
                 val pf = try { with(kotlinx.coroutines.Dispatchers.Default) { perception.processFrame(frame) } } catch (_: Exception) { null; }
                 if (pf == null) { metrics.onDropped(); return@collect }
                 val (score, snap) = fatigue.update(pf)
                 val didAlert = fatigue.handleAlert(pf.timestampMs)
                 val state = stateMachine.step(score, pf.timestampMs)
-                alerts.handleState(state, pf.timestampMs, didAlert)
+                val alertFired = alerts.handleState(state, pf.timestampMs, didAlert)
+                if (alertFired) triggerDeviceAlert()
 
                 metrics.onInferenceDone(System.currentTimeMillis() - t0, pf.faceConfidence, pf.trackingQuality, score, state.name)
                 _ui.value = UiState(
@@ -73,6 +83,7 @@ class MonitorViewModel(
                     yawnCount = snap.yawnCount, headAbnormal = pf.headPose?.abnormal == true,
                     trackingQuality = pf.trackingQuality, facePresent = pf.facePresent,
                     eventsToday = _ui.value.eventsToday, alertActive = state != DriverState.NORMAL,
+                    previewBitmap = previewBmp ?: _ui.value.previewBitmap,
                 )
                 handleEventLifecycle(pf, score, snap, state)
             }
@@ -85,6 +96,24 @@ class MonitorViewModel(
     }
 
     fun stop() { job?.cancel(); job = null; camera.stop() }
+
+    private val deviceHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder().apply {
+            deviceNetwork?.let { socketFactory(it.socketFactory) }
+        }.build()
+    }
+
+    // Fires the ESP32's own vehicle-mounted speaker alongside the phone beep. Best-effort —
+    // must never block or fail the phone-side alert if the device is unreachable.
+    private fun triggerDeviceAlert() {
+        val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            try {
+                val req = okhttp3.Request.Builder().url("$base/alert").get().build()
+                deviceHttpClient.newCall(req).execute().close()
+            } catch (_: Exception) { /* device offline/unreachable — phone alert already fired */ }
+        }
+    }
 
     private suspend fun handleEventLifecycle(pf: com.drowsy.perception.PerceptionFrame, score: Int, snap: TemporalSnapshot, state: DriverState) {
         // Resolve GPS with 2s timeout, fallback 0,0 — does not block state machine

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The ESP32 vehicle device and the local backend serve plain HTTP (no TLS — not feasible on a
+  microcontroller, and out of scope for this prototype). Android blocks cleartext traffic by
+  default since API 28. Scoped to local/private network ranges only — never applies to public
+  internet destinations.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- ESP32 vehicle device's own AP — fixed gateway IP -->
+        <domain includeSubdomains="false">192.168.4.1</domain>
+        <!-- backend_url during local demo/dev — private LAN only -->
+        <domain includeSubdomains="false">172.19.133.73</domain>
+    </domain-config>
+</network-security-config>

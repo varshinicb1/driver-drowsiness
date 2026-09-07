@@ -13,9 +13,14 @@ class MonitorViewModelFactory(
     private val camera: CameraSource,
     private val perception: DriverPerceptionEngine,
     private val locationProvider: LocationProvider? = null,
+    private val deviceBaseUrl: String? = null,
+    private val deviceNetwork: android.net.Network? = null,
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        return MonitorViewModel(app, camera, perception, locationProvider = locationProvider) as T
+        return MonitorViewModel(
+            app, camera, perception, locationProvider = locationProvider,
+            deviceBaseUrl = deviceBaseUrl, deviceNetwork = deviceNetwork,
+        ) as T
     }
 }

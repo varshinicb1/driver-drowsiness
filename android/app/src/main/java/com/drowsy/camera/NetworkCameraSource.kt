@@ -2,6 +2,7 @@ package com.drowsy.camera
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -23,11 +24,18 @@ class NetworkCameraSource(
     private val preferMjpeg: Boolean = true,
     private val reconnectDelayMs: Long = 2000,
     private val jpegQualityTimeoutMs: Int = 4000,
+    // When set (via WifiNetworkSpecifier), requests route through this specific WiFi network
+    // instead of the phone's default route — needed since the ESP32's AP has no internet and
+    // Android would otherwise prefer cellular for a bare URL.openConnection().
+    private val network: android.net.Network? = null,
 ) : CameraSource {
 
     override val name: String = "NetworkCamera:$baseUrl"
     override var isRunning: Boolean = false
         private set
+
+    private fun openConn(url: URL): HttpURLConnection =
+        (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
 
     @Volatile private var latencyMs: Long = -1
     fun lastLatencyMs(): Long = latencyMs
@@ -36,10 +44,12 @@ class NetworkCameraSource(
     override fun stop() { isRunning = false }
 
     override fun frames(): Flow<CameraFrame> = flow {
+        Log.d("NetworkCameraSource", "frames() started, isRunning=$isRunning, network=$network, baseUrl=$baseUrl")
         while (isRunning) {
             try {
                 if (preferMjpeg) emitMjpeg(this) else emitSnapshotLoop(this)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.e("NetworkCameraSource", "frames() loop exception: ${e.javaClass.simpleName}: ${e.message}", e)
                 // reconnect with backoff
                 delay(reconnectDelayMs)
             }
@@ -50,13 +60,15 @@ class NetworkCameraSource(
         val url = URL("$baseUrl/stream")
         var conn: HttpURLConnection? = null
         try {
-            conn = (url.openConnection() as HttpURLConnection).apply {
+            conn = openConn(url).apply {
                 requestMethod = "GET"
                 connectTimeout = jpegQualityTimeoutMs
                 readTimeout = 5000 // allow cancellation via timeout, not infinite block
                 setRequestProperty("Accept", "multipart/x-mixed-replace")
             }
+            Log.d("NetworkCameraSource", "emitMjpeg connecting to $url via network=$network")
             conn.connect()
+            Log.d("NetworkCameraSource", "emitMjpeg connected, responseCode=${conn.responseCode}")
             if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
             val input = conn.inputStream
             val buffer = ByteArray(64 * 1024)
@@ -97,7 +109,7 @@ class NetworkCameraSource(
             var conn: HttpURLConnection? = null
             try {
                 val url = URL("$baseUrl/snapshot")
-                conn = (url.openConnection() as HttpURLConnection).apply {
+                conn = openConn(url).apply {
                     connectTimeout = jpegQualityTimeoutMs; readTimeout = jpegQualityTimeoutMs
                 }
                 val bytes = conn.inputStream.readBytes()

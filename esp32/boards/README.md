@@ -9,6 +9,7 @@ Add a new board by copying `eye.h` → `myboard.h` and adding an env in `platfor
 | `esp32-s3-eye` | Freenove ESP32-S3-EYE / ESP32-S3-CAM | `boards/eye.h` | Default, PSRAM required, OV2640 on board |
 | `esp32-s3-devkitc-1` | Generic S3 + external OV2640 | `boards/devkitc.h` | Wire external camera as EYE pins + 5V/GND |
 | `esp32-s3-xiao` | Seeed XIAO ESP32S3 Sense | `boards/xiao.h` | On-board OV2640, different pins, 8MB PSRAM |
+| `esp32-s3-dfr1154` | DFRobot DFR1154 (ESP32-S3 AI Camera Module, SKU DFR1154) | `boards/dfr1154.h` | On-board OV3660, N16R8 (16MB flash/8MB octal PSRAM), pins verified from DFRobot's own CameraWebServer example |
 
 ## eye.h (default)
 

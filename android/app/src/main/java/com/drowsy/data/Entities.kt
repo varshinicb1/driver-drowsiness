@@ -17,7 +17,7 @@ data class Vehicle(
     val lastSeen: Long? = null, // epoch ms
 )
 
-@Entity(tableName = "devices")
+@Entity(tableName = "devices", indices = [Index("vehicleId")])
 data class Device(
     @PrimaryKey val deviceId: String,
     val vehicleId: String,
@@ -25,7 +25,7 @@ data class Device(
     val createdAt: Long = System.currentTimeMillis(),
 )
 
-@Entity(tableName = "fatigue_events", indices = [Index(value = ["vehicleId"]), Index(value = ["severity"]), Index(value = ["synced"])])
+@Entity(tableName = "fatigue_events", indices = [Index("deviceId"), Index(value = ["vehicleId"]), Index(value = ["severity"]), Index(value = ["synced"])])
 data class FatigueEvent(
     @PrimaryKey val eventId: String = UUID.randomUUID().toString(),
     val deviceId: String,

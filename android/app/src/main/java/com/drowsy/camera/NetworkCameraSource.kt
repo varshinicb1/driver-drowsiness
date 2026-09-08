@@ -8,26 +8,27 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.coroutines.coroutineContext
 
+enum class CameraConnectionState { IDLE, CONNECTING, LIVE, OFFLINE }
+
 /**
- * ESP32-S3 / generic MJPEG + snapshot (§17-20).
- *
- * Default mode is **snapshot polling** (not MJPEG): each GET /snapshot returns one fresh JPEG
- * with Connection: close, which avoids multipart TCP buffering and is much lower latency on ESP32 AP.
+ * Low-latency snapshot polling against ESP32 /snapshot (Connection: close per frame).
  */
 class NetworkCameraSource(
     private val baseUrl: String,
-    // Snapshot polling is lower-latency than MJPEG on ESP32 soft-AP (no multipart backlog).
     private val preferMjpeg: Boolean = false,
-    private val reconnectDelayMs: Long = 500,
-    private val connectTimeoutMs: Int = 1500,
-    private val readTimeoutMs: Int = 1500,
-    private val snapshotTargetFps: Int = 20,
+    private val reconnectDelayMs: Long = 800,
+    private val connectTimeoutMs: Int = 2000,
+    private val readTimeoutMs: Int = 2000,
+    private val snapshotTargetFps: Int = 15,
     private val network: android.net.Network? = null,
 ) : CameraSource {
 
@@ -35,25 +36,39 @@ class NetworkCameraSource(
     override var isRunning: Boolean = false
         private set
 
-    private fun openConn(url: URL): HttpURLConnection =
-        (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+    private val _connection = MutableStateFlow(CameraConnectionState.IDLE)
+    val connection: StateFlow<CameraConnectionState> = _connection.asStateFlow()
 
     @Volatile private var latencyMs: Long = -1
     fun lastLatencyMs(): Long = latencyMs
 
-    override fun start() { isRunning = true }
-    override fun stop() { isRunning = false }
+    private fun openConn(url: URL): HttpURLConnection =
+        (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+
+    override fun start() {
+        isRunning = true
+        _connection.value = CameraConnectionState.CONNECTING
+    }
+
+    override fun stop() {
+        isRunning = false
+        _connection.value = CameraConnectionState.IDLE
+    }
 
     override fun frames(): Flow<CameraFrame> = flow {
         if (BuildConfig.DEBUG) {
-            Log.d(TAG, "frames() mode=${if (preferMjpeg) "mjpeg" else "snapshot"} base=$baseUrl net=$network")
+            Log.d(TAG, "frames mode=${if (preferMjpeg) "mjpeg" else "snapshot"} url=$baseUrl")
         }
+        var offlineStreak = 0
         while (isRunning) {
             try {
                 if (preferMjpeg) emitMjpeg(this) else emitSnapshotLoop(this)
+                offlineStreak = 0
             } catch (e: Exception) {
-                if (BuildConfig.DEBUG) Log.e(TAG, "frames loop: ${e.message}")
-                delay(reconnectDelayMs)
+                offlineStreak++
+                _connection.value = CameraConnectionState.OFFLINE
+                if (BuildConfig.DEBUG) Log.w(TAG, "camera loop: ${e.message}")
+                delay(reconnectDelayMs.coerceAtMost(3000))
             }
         }
     }.flowOn(Dispatchers.IO)
@@ -70,10 +85,10 @@ class NetworkCameraSource(
         val opts = BitmapFactory.Options().apply {
             inSampleSize = 1
             inPreferredConfig = Bitmap.Config.ARGB_8888
-            inMutable = true
         }
-        val frameGapMs = (1000L / snapshotTargetFps.coerceIn(5, 30))
+        val frameGapMs = (1000L / snapshotTargetFps.coerceIn(5, 20))
         var seq = 0L
+        var failures = 0
         while (isRunning) {
             coroutineContext.ensureActive()
             val t0 = System.currentTimeMillis()
@@ -84,17 +99,21 @@ class NetworkCameraSource(
                     requestMethod = "GET"
                     configure(this)
                 }
-                val code = conn.responseCode
-                if (code != 200) throw IllegalStateException("HTTP $code")
+                if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
                 val bytes = conn.inputStream.use { it.readBytes() }
-                if (bytes.size < 100) continue
+                if (bytes.size < 100) throw IllegalStateException("empty frame")
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-                if (bmp != null) {
-                    latencyMs = System.currentTimeMillis() - t0
-                    collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
-                }
-            } catch (_: Exception) { /* drop frame */ }
-            finally { try { conn?.disconnect() } catch (_: Exception) {} }
+                    ?: throw IllegalStateException("decode failed")
+                latencyMs = System.currentTimeMillis() - t0
+                failures = 0
+                _connection.value = CameraConnectionState.LIVE
+                collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
+            } catch (_: Exception) {
+                failures++
+                if (failures >= 3) _connection.value = CameraConnectionState.OFFLINE
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
+            }
             val elapsed = System.currentTimeMillis() - t0
             val sleep = frameGapMs - elapsed
             if (sleep > 0) delay(sleep)
@@ -108,7 +127,7 @@ class NetworkCameraSource(
             conn = openConn(url).apply {
                 requestMethod = "GET"
                 configure(this)
-                readTimeout = 3000
+                readTimeout = 4000
                 setRequestProperty("Accept", "multipart/x-mixed-replace")
             }
             conn.connect()
@@ -122,24 +141,20 @@ class NetworkCameraSource(
                 val n = try { input.read(buffer) } catch (_: Exception) { break }
                 if (n <= 0) break
                 leftover = leftover + buffer.copyOfRange(0, n)
-                // Decode only the *last* complete JPEG in the buffer — drop backlog frames.
                 var lastStart = -1
                 var lastEnd = -1
                 var i = 0
                 while (i < leftover.size - 1) {
                     if (leftover[i] == 0xFF.toByte() && leftover[i + 1] == 0xD8.toByte()) lastStart = i
-                    if (leftover[i] == 0xFF.toByte() && leftover[i + 1] == 0xD9.toByte() && lastStart >= 0) {
-                        lastEnd = i + 1
-                    }
+                    if (leftover[i] == 0xFF.toByte() && leftover[i + 1] == 0xD9.toByte() && lastStart >= 0) lastEnd = i + 1
                     i++
                 }
                 if (lastStart >= 0 && lastEnd > lastStart) {
                     val jpeg = leftover.copyOfRange(lastStart, lastEnd + 1)
                     leftover = if (lastEnd + 1 < leftover.size) leftover.copyOfRange(lastEnd + 1, leftover.size) else ByteArray(0)
-                    val t0 = System.currentTimeMillis()
                     val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
                     if (bmp != null) {
-                        latencyMs = System.currentTimeMillis() - t0
+                        _connection.value = CameraConnectionState.LIVE
                         collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
                     }
                 } else if (leftover.size > 128 * 1024) {

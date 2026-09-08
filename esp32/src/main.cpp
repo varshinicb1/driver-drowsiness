@@ -7,6 +7,9 @@
 #include <esp_camera.h>
 #include <esp_http_server.h>
 #include <driver/i2s.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -26,19 +29,36 @@
 
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t snapshot_httpd = NULL;
-static bool nightVisionOn = false; // IR off in daylight — IR + AEC makes the visible image look dark
+static bool nightVisionOn = false;
+static SemaphoreHandle_t cameraMux = NULL;
+static SemaphoreHandle_t i2sMux = NULL;
 
-// Latest JPEG only — skip stale frames in the DMA queue before capture/send.
-static camera_fb_t *grabFreshFrame() {
-  for (int i = 0; i < 2; i++) {
-    camera_fb_t *stale = esp_camera_fb_get();
-    if (!stale) return nullptr;
-    esp_camera_fb_return(stale);
+static void withCameraMux(void (*fn)(void *), void *arg) {
+  if (cameraMux && xSemaphoreTake(cameraMux, pdMS_TO_TICKS(3000)) == pdTRUE) {
+    fn(arg);
+    xSemaphoreGive(cameraMux);
   }
-  return esp_camera_fb_get();
 }
 
-static void applyNightVisionHardware() {
+struct FreshFrameCtx { camera_fb_t **out; };
+static void grabFreshFrameFn(void *arg) {
+  auto *ctx = (FreshFrameCtx *)arg;
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (!stale) { *ctx->out = nullptr; return; }
+    esp_camera_fb_return(stale);
+  }
+  *ctx->out = esp_camera_fb_get();
+}
+
+static camera_fb_t *grabFreshFrame() {
+  camera_fb_t *fb = nullptr;
+  FreshFrameCtx ctx = { &fb };
+  withCameraMux(grabFreshFrameFn, &ctx);
+  return fb;
+}
+
+static void applyNightVisionFn(void *) {
 #ifdef LED_GPIO_NUM
   digitalWrite(LED_GPIO_NUM, nightVisionOn ? HIGH : LOW);
 #endif
@@ -69,6 +89,10 @@ static void applyNightVisionHardware() {
     s->set_contrast(s, 1);
     s->set_saturation(s, 1);
   }
+}
+
+static void applyNightVisionHardware() {
+  withCameraMux(applyNightVisionFn, nullptr);
 }
 
 #ifdef SPK_BCLK_GPIO_NUM
@@ -103,7 +127,8 @@ static bool ensureSpeaker() {
 // Rising two-tone beep (900Hz -> 1400Hz), stereo-duplicated so it plays regardless of the
 // MAX98357's L/R gain-pin strapping.
 static void playAlertTone() {
-  if (!ensureSpeaker()) return;
+  if (i2sMux && xSemaphoreTake(i2sMux, pdMS_TO_TICKS(5000)) != pdTRUE) return;
+  if (!ensureSpeaker()) { xSemaphoreGive(i2sMux); return; }
   const int sampleRate = 16000;
   const int freqs[2] = {900, 1400};
   const int toneMs = 220;
@@ -125,10 +150,16 @@ static void playAlertTone() {
     }
     delay(40);
   }
+  xSemaphoreGive(i2sMux);
+}
+
+static void alertTask(void *) {
+  playAlertTone();
+  vTaskDelete(NULL);
 }
 
 static esp_err_t alert_handler(httpd_req_t *req) {
-  playAlertTone();
+  xTaskCreate(alertTask, "alert", 4096, NULL, 1, NULL);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -190,6 +221,9 @@ static esp_err_t audioclip_handler(httpd_req_t *req) {
   if (seconds > 8) seconds = 8;
 
   if (!ensureMic()) { httpd_resp_send_500(req); return ESP_FAIL; }
+  if (i2sMux && xSemaphoreTake(i2sMux, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    httpd_resp_send_500(req); return ESP_FAIL;
+  }
 
   size_t dataBytes = (size_t)16000 * 2 * seconds;
   uint8_t *pcm = (uint8_t *)malloc(dataBytes);
@@ -211,6 +245,7 @@ static esp_err_t audioclip_handler(httpd_req_t *req) {
   httpd_resp_send_chunk(req, (const char *)pcm, totalRead);
   httpd_resp_send_chunk(req, NULL, 0);
   free(pcm);
+  if (i2sMux) xSemaphoreGive(i2sMux);
   return ESP_OK;
 }
 #endif
@@ -305,6 +340,8 @@ void startServer() {
 
 void setup() {
   Serial.begin(115200);
+  cameraMux = xSemaphoreCreateMutex();
+  i2sMux = xSemaphoreCreateMutex();
 #ifdef LED_GPIO_NUM
   pinMode(LED_GPIO_NUM, OUTPUT);
   digitalWrite(LED_GPIO_NUM, LOW); // IR off before camera init

@@ -13,24 +13,38 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.drowsy.camera.AndroidFrontCameraSource
+import com.drowsy.camera.CameraConnectionState
 import com.drowsy.camera.CameraSource
 import com.drowsy.fatigue.DriverState
 import com.drowsy.location.FusedLocationProvider
 import com.drowsy.network.DeviceWifiConnector
 import com.drowsy.perception.MediaPipeLandmarkerEngine
 import com.drowsy.perception.Point2D
+import com.drowsy.ui.theme.DrowsyPalette
+import com.drowsy.ui.theme.DrowsyTheme
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -57,12 +71,12 @@ class MainActivity : ComponentActivity() {
         val landmarker = MediaPipeLandmarkerEngine(applicationContext)
         val modelReady = landmarker.initialize()
         val modelLabel = landmarker.statusMessage
-        val perception = landmarker
         val locationProvider = FusedLocationProvider(applicationContext)
 
         setContent {
-            MaterialTheme {
+            DrowsyTheme {
                 var ready by remember { mutableStateOf<Pair<CameraSource, android.net.Network?>?>(null) }
+                var wifiError by remember { mutableStateOf<String?>(null) }
                 var connecting by remember { mutableStateOf(source == "network") }
 
                 LaunchedEffect(Unit) {
@@ -72,8 +86,10 @@ class MainActivity : ComponentActivity() {
                             onConnected = { network ->
                                 ready = com.drowsy.camera.NetworkCameraSource(deviceBaseUrl, network = network) to network
                                 connecting = false
+                                wifiError = null
                             },
                             onFailed = {
+                                wifiError = "Join Wi-Fi \"$apSsid\" manually in Settings, then reopen the app."
                                 ready = com.drowsy.camera.NetworkCameraSource(deviceBaseUrl) to null
                                 connecting = false
                             },
@@ -86,22 +102,20 @@ class MainActivity : ComponentActivity() {
 
                 val current = ready
                 if (current == null) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text(if (connecting) "Connecting to vehicle deviceΓÇª" else "StartingΓÇª")
-                    }
+                    LoadingScreen(if (connecting) "Connecting to $apSsid…" else "Starting…")
                 } else {
                     val (camera, network) = current
-                    val factory = remember(camera) {
-                        val vehicleUrl = if (source == "network") deviceBaseUrl else null
+                    val vehicleUrl = if (source == "network") deviceBaseUrl else null
+                    val factory = remember(camera, vehicleUrl) {
                         MonitorViewModelFactory(
-                            application, camera, perception, locationProvider, vehicleUrl, network,
+                            application, camera, landmarker, locationProvider, vehicleUrl, network,
                             modelReady, modelLabel,
                         )
                     }
                     val vm: MonitorViewModel = viewModel(factory = factory)
                     LaunchedEffect(camera) { if (hasPermissions()) vm.start() }
                     DisposableEffect(camera) { onDispose { vm.stop() } }
-                    AppShell(vm)
+                    AppShell(vm, wifiError)
                 }
             }
         }
@@ -117,42 +131,63 @@ class MainActivity : ComponentActivity() {
     } catch (_: Exception) { null }
 
     private fun createCameraSource(source: String, networkUrl: String): CameraSource {
-        return if (source == "network") {
-            com.drowsy.camera.NetworkCameraSource(networkUrl)
-        } else if (source == "uvc") {
-            com.drowsy.camera.UsbUvcCameraSource()
-        } else {
-            AndroidFrontCameraSource(applicationContext, this)
+        return when (source) {
+            "network" -> com.drowsy.camera.NetworkCameraSource(networkUrl)
+            "uvc" -> com.drowsy.camera.UsbUvcCameraSource()
+            else -> AndroidFrontCameraSource(applicationContext, this)
         }
     }
 
-    private fun hasPermissions(): Boolean {
-        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+    private fun hasPermissions(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+}
+
+@Composable
+private fun LoadingScreen(message: String) {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            CircularProgressIndicator()
+            Text(message, style = MaterialTheme.typography.bodyLarge)
+        }
     }
 }
 
-private enum class AppTab { Monitor, Events, Device }
+private enum class AppTab(val label: String) {
+    Monitor("Monitor"), Events("Events"), Device("Device")
+}
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AppShell(vm: MonitorViewModel) {
+fun AppShell(vm: MonitorViewModel, wifiHint: String?) {
     var tab by remember { mutableStateOf(AppTab.Monitor) }
     Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Driver Safety", fontWeight = FontWeight.SemiBold) },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
+            )
+        },
         bottomBar = {
             NavigationBar {
                 AppTab.entries.forEach { item ->
+                    val icon = when (item) {
+                        AppTab.Monitor -> Icons.Default.Videocam
+                        AppTab.Events -> Icons.Default.History
+                        AppTab.Device -> Icons.Default.Settings
+                    }
                     NavigationBarItem(
                         selected = tab == item,
                         onClick = { tab = item },
-                        icon = { Text(item.name.take(1)) },
-                        label = { Text(item.name) },
+                        icon = { Icon(icon, contentDescription = item.label) },
+                        label = { Text(item.label) },
                     )
                 }
             }
-        }
+        },
     ) { padding ->
         Box(Modifier.padding(padding).fillMaxSize()) {
             when (tab) {
-                AppTab.Monitor -> MonitorScreen(vm)
+                AppTab.Monitor -> MonitorScreen(vm, wifiHint)
                 AppTab.Events -> EventsScreen(vm)
                 AppTab.Device -> DeviceScreen(vm)
             }
@@ -161,12 +196,78 @@ fun AppShell(vm: MonitorViewModel) {
 }
 
 @Composable
-fun MonitorScreen(vm: MonitorViewModel) {
+fun MonitorScreen(vm: MonitorViewModel, wifiHint: String?) {
     val ui by vm.ui.collectAsState()
     val perf by vm.perf.collectAsState()
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("DRIVER SAFETY", style = MaterialTheme.typography.headlineSmall)
-        Box(Modifier.fillMaxWidth().height(280.dp).background(Color(0xFF111111))) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        ConnectionBanner(ui.cameraConnection, ui.streamLatencyMs, wifiHint)
+        CameraCard(ui)
+        ModelStatusRow(ui)
+        MetricsRow(ui)
+        StatusCard(ui)
+        if (com.drowsy.BuildConfig.ENABLE_PERF_OVERLAY) PerfOverlay(perf)
+        if (ui.vehicleDevice) {
+            NightVisionRow(ui.nightVisionOn) { vm.setNightVision(it) }
+        }
+        if (ui.state == DriverState.FATIGUE || ui.state == DriverState.HIGH_RISK) {
+            FatigueAlertCard(ui)
+        }
+    }
+}
+
+@Composable
+private fun ConnectionBanner(state: CameraConnectionState, latencyMs: Long, wifiHint: String?) {
+    val (color, icon, text) = when (state) {
+        CameraConnectionState.LIVE -> Triple(
+            DrowsyPalette.normal,
+            Icons.Default.Wifi,
+            if (latencyMs > 0) "Camera live · ${latencyMs}ms" else "Camera live",
+        )
+        CameraConnectionState.CONNECTING -> Triple(
+            DrowsyPalette.attention,
+            Icons.Default.Wifi,
+            "Connecting to vehicle camera…",
+        )
+        CameraConnectionState.OFFLINE -> Triple(
+            MaterialTheme.colorScheme.error,
+            Icons.Default.WifiOff,
+            "Camera offline — join DRIVER-CAM Wi-Fi",
+        )
+        CameraConnectionState.IDLE -> Triple(
+            MaterialTheme.colorScheme.surfaceVariant,
+            Icons.Default.Wifi,
+            "Camera idle",
+        )
+    }
+    Card(colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.15f))) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, contentDescription = null, tint = color)
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(text, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Medium)
+                if (wifiHint != null) {
+                    Text(wifiHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(0.7f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CameraCard(ui: UiState) {
+    Card(shape = RoundedCornerShape(16.dp)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(260.dp)
+                .background(DrowsyPalette.cameraBg),
+        ) {
             val bmp = ui.previewBitmap
             if (bmp != null) {
                 Image(
@@ -177,51 +278,82 @@ fun MonitorScreen(vm: MonitorViewModel) {
                 )
                 FaceMeshOverlay(ui.landmarks, Modifier.fillMaxSize())
             }
-            Text(
-                when {
-                    bmp == null -> "Waiting for cameraΓÇª"
-                    ui.facePresent -> "Face landmarker: tracking"
-                    else -> "No face in frame"
-                },
-                color = Color.White,
-                modifier = Modifier.align(Alignment.TopStart).padding(8.dp),
-            )
-        }
-        Text(
-            if (ui.modelReady) "Face model: ${ui.modelLabel}" else "Face model not loaded: ${ui.modelLabel}",
-            style = MaterialTheme.typography.bodySmall,
-            color = if (ui.modelReady) Color(0xFF2E7D32) else Color(0xFFB00020),
-        )
-        Text(
-            "Drowsiness (EAR/MAR/PERCLOS): EAR ${"%.2f".format(ui.ear)}  MAR ${"%.2f".format(ui.mar)}  PERCLOS ${"%.0f".format(ui.perclos * 100)}%",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Text(
-            "Eyes ${if (ui.eyesClosed) "CLOSED" else "open"} ┬╖ Yawn ${if (ui.yawning) "YES" else "no"}",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        StatusCard(ui)
-        if (com.drowsy.BuildConfig.ENABLE_PERF_OVERLAY) {
-            PerfOverlay(perf)
-        }
-        if (ui.vehicleDevice) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+            Box(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(10.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(DrowsyPalette.overlay)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
             ) {
-                Text("Night vision (IR)", style = MaterialTheme.typography.bodyMedium)
-                Switch(checked = ui.nightVisionOn, onCheckedChange = { vm.setNightVision(it) })
+                Text(
+                    when {
+                        bmp == null -> "Waiting for camera…"
+                        ui.facePresent -> "Face tracked"
+                        else -> "No face detected"
+                    },
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelLarge,
+                )
             }
         }
-        if (ui.state == DriverState.FATIGUE || ui.state == DriverState.HIGH_RISK) {
-            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFB00020))) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("ΓÜá FATIGUE DETECTED", color = Color.White, style = MaterialTheme.typography.titleMedium)
-                    Text("Fatigue score: ${ui.score} / 100", color = Color.White)
-                    Text(if (ui.alertActive) "≡ƒöè ALERT PLAYING" else "", color = Color.White)
-                }
-            }
+    }
+}
+
+@Composable
+private fun ModelStatusRow(ui: UiState) {
+    val ok = ui.modelReady
+    AssistChip(
+        onClick = {},
+        label = { Text(if (ok) "Face model ready" else "Face model missing") },
+        leadingIcon = {},
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = if (ok) DrowsyPalette.normal.copy(0.2f) else MaterialTheme.colorScheme.error.copy(0.2f),
+        ),
+    )
+    if (!ok) {
+        Text(ui.modelLabel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    }
+}
+
+@Composable
+private fun MetricsRow(ui: UiState) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        MetricChip("EAR", "%.2f".format(ui.ear))
+        MetricChip("MAR", "%.2f".format(ui.mar))
+        MetricChip("PERCLOS", "${"%.0f".format(ui.perclos * 100)}%")
+        MetricChip("Score", "${ui.score}")
+    }
+}
+
+@Composable
+private fun MetricChip(label: String, value: String) {
+    Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(label, style = MaterialTheme.typography.labelSmall)
+            Text(value, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun NightVisionRow(on: Boolean, onToggle: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+        Column {
+            Text("Night vision (IR)", style = MaterialTheme.typography.titleSmall)
+            Text("Off in daylight", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(0.6f))
+        }
+        Switch(checked = on, onCheckedChange = onToggle)
+    }
+}
+
+@Composable
+private fun FatigueAlertCard(ui: UiState) {
+    Card(colors = CardDefaults.cardColors(containerColor = DrowsyPalette.highRisk)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("FATIGUE DETECTED", color = Color.White, fontWeight = FontWeight.Bold)
+            Text("Score ${ui.score} / 100", color = Color.White)
+            if (ui.alertActive) Text("Alert sounding", color = Color.White)
         }
     }
 }
@@ -234,10 +366,8 @@ fun FaceMeshOverlay(landmarks: List<Point2D>?, modifier: Modifier) {
         val w = size.width
         val h = size.height
         landmarks.forEachIndexed { i, p ->
-            val x = p.x * w
-            val y = p.y * h
-            val r = if (i in key) 5f else 1.6f
-            drawCircle(Color(0xFF00E676), radius = r, center = Offset(x, y))
+            val r = if (i in key) 4f else 1.5f
+            drawCircle(Color(0xFF00E676), radius = r, center = Offset(p.x * w, p.y * h))
         }
     }
 }
@@ -247,18 +377,24 @@ fun EventsScreen(vm: MonitorViewModel) {
     val ui by vm.ui.collectAsState()
     val fmt = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Events", style = MaterialTheme.typography.headlineSmall)
-        Text("Today: ${ui.eventsToday}", style = MaterialTheme.typography.bodyMedium)
+        Text("Fatigue events", style = MaterialTheme.typography.headlineSmall)
+        Text("Today: ${ui.eventsToday}")
         if (ui.recentEvents.isEmpty()) {
-            Text("No fatigue events stored yet. Close your eyes for a few seconds on the Monitor tab to generate one.")
+            Text(
+                "No events yet. Close your eyes for a few seconds while facing the camera.",
+                color = MaterialTheme.colorScheme.onSurface.copy(0.7f),
+            )
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(ui.recentEvents, key = { it.eventId }) { ev ->
                     Card {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("${ev.severity} ┬╖ score ${ev.maxFatigueScore}", style = MaterialTheme.typography.titleMedium)
-                            Text(fmt.format(Date(ev.timestampStart)) + "  ${ev.durationMs} ms")
-                            Text("eyes=${ev.eyeClosure} yawn=${ev.yawning} head=${ev.headPoseAbnormal} recovered=${ev.recovered}")
+                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("${ev.severity} · score ${ev.maxFatigueScore}", fontWeight = FontWeight.SemiBold)
+                            Text("${fmt.format(Date(ev.timestampStart))} · ${ev.durationMs} ms")
+                            Text(
+                                "Eyes ${ev.eyeClosure} · Yawn ${ev.yawning} · Recovered ${ev.recovered}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
                         }
                     }
                 }
@@ -270,31 +406,34 @@ fun EventsScreen(vm: MonitorViewModel) {
 @Composable
 fun DeviceScreen(vm: MonitorViewModel) {
     val ui by vm.ui.collectAsState()
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
         Text("Device", style = MaterialTheme.typography.headlineSmall)
-        Text("Face detector: ${ui.modelLabel}")
-        Text("Drowsiness: on-device EAR + MAR + PERCLOS (not a separate TFLite drowsiness net)")
+        Text(ui.modelLabel, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            "Drowsiness uses EAR + MAR + PERCLOS on-device (no separate drowsiness neural net).",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(0.7f),
+        )
         if (ui.vehicleDevice) {
-            Text("ESP32 at vehicle AP ΓÇö speaker, mic, and IR are on the camera board.")
+            Text("ESP32 camera board — speaker, mic, and IR are on the vehicle unit.")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = { vm.testVehicleSpeaker() }) { Text("Test speaker") }
-                Button(onClick = { vm.testDeviceMic() }) { Text("Test mic") }
+                OutlinedButton(onClick = { vm.testDeviceMic() }) { Text("Test mic") }
             }
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Night vision (IR)")
-                Switch(checked = ui.nightVisionOn, onCheckedChange = { vm.setNightVision(it) })
-            }
-            Text("Speaker only plays if a 4╬⌐/8╬⌐ speaker is plugged into the boardΓÇÖs SPK connector.", style = MaterialTheme.typography.bodySmall)
+            NightVisionRow(ui.nightVisionOn) { vm.setNightVision(it) }
+            Text(
+                "Plug a 4 ohm or 8 ohm speaker into the board SPK connector.",
+                style = MaterialTheme.typography.bodySmall,
+            )
         } else {
-            Text("Phone front camera mode ΓÇö vehicle speaker/mic are unavailable.")
+            Text("Using phone camera — vehicle hardware tests are unavailable.")
         }
-        Button(onClick = { vm.testPhoneBeep() }) { Text("Test phone beep") }
+        OutlinedButton(onClick = { vm.testPhoneBeep() }) { Text("Test phone beep") }
         if (ui.deviceMessage.isNotBlank()) {
-            Text(ui.deviceMessage, style = MaterialTheme.typography.bodySmall)
+            Text(ui.deviceMessage, style = MaterialTheme.typography.bodySmall, color = DrowsyPalette.attention)
         }
     }
 }
@@ -302,18 +441,21 @@ fun DeviceScreen(vm: MonitorViewModel) {
 @Composable
 fun StatusCard(ui: UiState) {
     val color = when (ui.state) {
-        DriverState.NORMAL -> Color(0xFF2E7D32)
-        DriverState.ATTENTION -> Color(0xFFF9A825)
-        DriverState.FATIGUE -> Color(0xFFEF6C00)
-        DriverState.HIGH_RISK -> Color(0xFFB00020)
+        DriverState.NORMAL -> DrowsyPalette.normal
+        DriverState.ATTENTION -> DrowsyPalette.attention
+        DriverState.FATIGUE -> DrowsyPalette.fatigue
+        DriverState.HIGH_RISK -> DrowsyPalette.highRisk
     }
-    Card(colors = CardDefaults.cardColors(containerColor = color)) {
-        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Status: ${ui.state.name}", color = Color.White, style = MaterialTheme.typography.titleLarge)
-            Text("Fatigue score: ${ui.score} / 100", color = Color.White)
-            Text("Eyes: ${if (ui.maxClosureMs > 1000) "Prolonged closure ${ui.maxClosureMs}ms" else "Normal"}", color = Color.White)
-            Text("Blinking/Yawns: ${ui.yawnCount} yawns", color = Color.White)
-            Text("Head pose: ${if (ui.headAbnormal) "Abnormal" else "Normal"}", color = Color.White)
+    Card(colors = CardDefaults.cardColors(containerColor = color), shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(ui.state.name, color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text("Fatigue ${ui.score} / 100", color = Color.White)
+            Text(
+                "Eyes: ${if (ui.maxClosureMs > 1000) "Closed ${ui.maxClosureMs}ms" else if (ui.eyesClosed) "Closed" else "Open"}",
+                color = Color.White,
+            )
+            Text("Yawns: ${ui.yawnCount}", color = Color.White)
+            Text("Head: ${if (ui.headAbnormal) "Abnormal" else "Normal"}", color = Color.White)
             Text(
                 "Tracking: ${when {
                     ui.trackingQuality > 0.7f -> "Good"
@@ -329,9 +471,8 @@ fun StatusCard(ui: UiState) {
 @Composable
 fun PerfOverlay(perf: com.drowsy.metrics.PerfSnapshot) {
     Text(
-        "FPS: ${"%.1f".format(perf.inferenceFps)}  Inference: ${perf.inferenceMs}ms  " +
-            "E2E: ${perf.endToEndMs}ms  Face: ${"%.2f".format(perf.faceConfidence)}  " +
-            "Fatigue: ${perf.fatigueScore}  State: ${perf.state}",
-        style = MaterialTheme.typography.labelSmall, color = Color.Gray
+        "FPS ${"%.1f".format(perf.inferenceFps)} · infer ${perf.inferenceMs}ms · face ${"%.2f".format(perf.faceConfidence)} · ${perf.state}",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurface.copy(0.5f),
     )
 }

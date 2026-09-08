@@ -35,8 +35,8 @@ class FatigueEngine(
         return score to snap
     }
 
-    /** Returns true if an alert was triggered (for cooldown tracking). */
-    fun handleAlert(nowMs: Long): Boolean {
+    /** True when cooldown elapsed — use for periodic re-alert while fatigued. */
+    fun shouldRepeatAlert(nowMs: Long): Boolean {
         if (!canAlert(nowMs)) return false
         markAlert(nowMs)
         return true

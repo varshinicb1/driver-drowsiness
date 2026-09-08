@@ -21,7 +21,7 @@ interface AlertManager {
     fun fatigueWarning(nowMs: Long)
     fun highRiskWarning(nowMs: Long)
     fun stop(nowMs: Long)
-    fun handleState(state: DriverState, nowMs: Long, didAlert: Boolean): Boolean
+    fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): Boolean
 }
 
 class PhoneAlertManager(
@@ -58,13 +58,19 @@ class PhoneAlertManager(
         active = AlertLevel.NONE
     }
 
-    override fun handleState(state: DriverState, nowMs: Long, didAlert: Boolean): Boolean {
+    override fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): Boolean {
+        val prev = active
         return when {
-            state == DriverState.HIGH_RISK && didAlert -> { highRiskWarning(nowMs); true }
-            state == DriverState.FATIGUE && didAlert -> { fatigueWarning(nowMs); true }
-            state == DriverState.ATTENTION && beepOnAttention && didAlert -> { attention(nowMs); true }
+            state == DriverState.HIGH_RISK && (prev != AlertLevel.HIGH_RISK || allowRepeat) -> {
+                highRiskWarning(nowMs); true
+            }
+            state == DriverState.FATIGUE && (prev != AlertLevel.FATIGUE && prev != AlertLevel.HIGH_RISK || allowRepeat) -> {
+                fatigueWarning(nowMs); true
+            }
+            state == DriverState.ATTENTION && beepOnAttention && (prev == AlertLevel.NONE || allowRepeat) -> {
+                attention(nowMs); true
+            }
             state == DriverState.NORMAL -> { stop(nowMs); false }
-            state == DriverState.ATTENTION -> { if (active != AlertLevel.NONE && active != AlertLevel.ATTENTION) stop(nowMs); false }
             else -> false
         }
     }

@@ -17,9 +17,12 @@ ESP32-S3 is **only camera/transport** for V1 (§17). No fatigue AI on device.
 
 ## Endpoints
 ```
-GET /stream   → multipart/x-mixed-replace MJPEG
-GET /snapshot → single JPEG
-GET /status   → JSON { uptime, fps, width, height, clients }
+GET /stream       → multipart/x-mixed-replace MJPEG
+GET /snapshot     → single JPEG
+GET /status       → JSON { uptime, fps, width, height, clients, nightVision }
+GET /alert        → two-tone beep on the MAX98357 speaker (DFR1154)
+GET /audio-clip?sec=N → WAV from onboard PDM mic (1–8 s)
+GET /night-vision?on=0|1 → IR LED (GPIO47) + low-light AGC
 ```
 
 ## Flash

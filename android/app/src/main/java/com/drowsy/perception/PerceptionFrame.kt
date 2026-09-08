@@ -48,4 +48,6 @@ data class PerceptionFrame(
     val rightEye: EyeFeatures? = null,
     val nose: Point2D? = null,
     val faceOrientation: HeadPose? = null,
+    /** Normalized 0..1 landmarks for UI overlay only; fatigue ignores this. */
+    val landmarks: List<Point2D>? = null,
 )

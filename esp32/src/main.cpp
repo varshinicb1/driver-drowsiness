@@ -26,7 +26,50 @@
 
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t snapshot_httpd = NULL;
-static bool nightVisionOn = true; // IR LED on by default — indoor/vehicle use is usually dim
+static bool nightVisionOn = false; // IR off in daylight — IR + AEC makes the visible image look dark
+
+// Latest JPEG only — skip stale frames in the DMA queue before capture/send.
+static camera_fb_t *grabFreshFrame() {
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (!stale) return nullptr;
+    esp_camera_fb_return(stale);
+  }
+  return esp_camera_fb_get();
+}
+
+static void applyNightVisionHardware() {
+#ifdef LED_GPIO_NUM
+  digitalWrite(LED_GPIO_NUM, nightVisionOn ? HIGH : LOW);
+#endif
+  sensor_t *s = esp_camera_sensor_get();
+  if (s == nullptr) return;
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_exposure_ctrl(s, 1);
+  s->set_gain_ctrl(s, 1);
+  s->set_raw_gma(s, 1);
+  s->set_lenc(s, 1);
+  s->set_bpc(s, 0);
+  s->set_wpc(s, 1);
+  s->set_dcw(s, 1);
+  if (nightVisionOn) {
+    s->set_aec2(s, 1);
+    s->set_gainceiling(s, GAINCEILING_8X);
+    s->set_ae_level(s, 0);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, -1);
+  } else {
+    // Daylight / room light: max auto-exposure lift, IR must stay off.
+    s->set_aec2(s, 0);
+    s->set_gainceiling(s, GAINCEILING_128X);
+    s->set_ae_level(s, 2);      // +2 EV
+    s->set_brightness(s, 2);  // max
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 1);
+  }
+}
 
 #ifdef SPK_BCLK_GPIO_NUM
 // Vehicle-mounted audible alert — I2S STD TX to onboard MAX98357 amp (§ AIS-184 acoustic warning).
@@ -38,7 +81,7 @@ static bool ensureSpeaker() {
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
   cfg.sample_rate = 16000;
   cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count = 4;
@@ -64,7 +107,7 @@ static void playAlertTone() {
   const int sampleRate = 16000;
   const int freqs[2] = {900, 1400};
   const int toneMs = 220;
-  int16_t buf[128 * 2];
+  int16_t buf[128];
   for (int t = 0; t < 2; t++) {
     int period = sampleRate / freqs[t];
     int samples = (sampleRate * toneMs) / 1000;
@@ -74,11 +117,10 @@ static void playAlertTone() {
       for (int i = 0; i < chunkSamples; i++) {
         int idx = written + i;
         bool high = (idx % period) < (period / 2);
-        int16_t v = high ? 12000 : -12000;
-        buf[i * 2] = v; buf[i * 2 + 1] = v;
+        buf[i] = high ? 22000 : -22000;
       }
       size_t bytesWritten = 0;
-      i2s_write(I2S_NUM_1, buf, chunkSamples * 2 * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+      i2s_write(I2S_NUM_1, buf, chunkSamples * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
       written += chunkSamples;
     }
     delay(40);
@@ -176,26 +218,30 @@ static esp_err_t audioclip_handler(httpd_req_t *req) {
 static esp_err_t status_handler(httpd_req_t *req) {
   char buf[256];
   snprintf(buf, sizeof(buf),
-    "{\"uptime\":%lu,\"width\":%d,\"height\":%d,\"fps\":10,\"clients\":%d}",
-    millis()/1000, 640, 480, WiFi.softAPgetStationNum());
+    "{\"uptime\":%lu,\"width\":%d,\"height\":%d,\"fps\":20,\"clients\":%d,\"nightVision\":%s}",
+    millis()/1000, 480, 320, WiFi.softAPgetStationNum(),
+    nightVisionOn ? "true" : "false");
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, strlen(buf));
 }
 
 static esp_err_t snapshot_handler(httpd_req_t *req) {
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = grabFreshFrame();
   if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
   httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_send(req, (const char*)fb->buf, fb->len);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+  httpd_resp_set_hdr(req, "Connection", "close");
+  esp_err_t res = httpd_resp_send(req, (const char*)fb->buf, fb->len);
   esp_camera_fb_return(fb);
-  return ESP_OK;
+  return res;
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   char part_hdr[64];
   while (true) {
-    camera_fb_t *fb = esp_camera_fb_get();
+    camera_fb_t *fb = grabFreshFrame();
     if (!fb) continue;
     snprintf(part_hdr, sizeof(part_hdr),
       "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
@@ -203,7 +249,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len) != ESP_OK) { esp_camera_fb_return(fb); break; }
     if (httpd_resp_send_chunk(req, "\r\n", 2) != ESP_OK) { esp_camera_fb_return(fb); break; }
     esp_camera_fb_return(fb);
-    vTaskDelay(100 / portTICK_PERIOD_MS); // ~10 FPS
+    // No artificial delay — send as fast as WiFi + sensor allow (~15–25 FPS).
+    if (httpd_req_to_sockfd(req) < 0) break;
   }
   return ESP_OK;
 }
@@ -215,7 +262,7 @@ static esp_err_t nightvision_handler(httpd_req_t *req) {
     char val[4];
     if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
       nightVisionOn = atoi(val) != 0;
-      digitalWrite(LED_GPIO_NUM, nightVisionOn ? HIGH : LOW);
+      applyNightVisionHardware();
     }
   }
   char buf[32];
@@ -228,6 +275,11 @@ static esp_err_t nightvision_handler(httpd_req_t *req) {
 void startServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
+  config.lru_purge_enable = true;
+  config.max_open_sockets = 4;
+  config.recv_wait_timeout = 2;
+  config.send_wait_timeout = 2;
+  config.stack_size = 8192;
   httpd_handle_t server = NULL;
   if (httpd_start(&server, &config) == ESP_OK) {
     httpd_uri_t s1 = {.uri="/status", .method=HTTP_GET, .handler=status_handler, .user_ctx=NULL};
@@ -253,6 +305,11 @@ void startServer() {
 
 void setup() {
   Serial.begin(115200);
+#ifdef LED_GPIO_NUM
+  pinMode(LED_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_GPIO_NUM, LOW); // IR off before camera init
+#endif
+  WiFi.setSleep(false); // AP latency: keep radio awake
   // Wi-Fi — secrets.h optional; defaults to direct demo AP (§18, docs/hardware.md:3)
   WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
   Serial.printf("AP %s at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
@@ -292,8 +349,9 @@ void setup() {
   cfg.pin_sccb_sda = 26; cfg.pin_sccb_scl = 27; cfg.pin_pwdn = 32; cfg.pin_reset = -1;
 #endif
   cfg.xclk_freq_hz = 20000000; cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size = FRAMESIZE_VGA; // 640x480 (§19)
-  cfg.jpeg_quality = 12; // 0-63 lower=better, ~70 quality (spec 60-75 JPEG ≈ 12)
+  // HVGA = faster encode + transfer than VGA; enough for face landmarks at ~30 cm.
+  cfg.frame_size = FRAMESIZE_HVGA;
+  cfg.jpeg_quality = 18; // 0-63 lower=better; 18 ≈ fast ~50% JPEG, good for low latency
   cfg.fb_count = 2; cfg.fb_location = CAMERA_FB_IN_PSRAM; cfg.grab_mode = CAMERA_GRAB_LATEST;
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) Serial.printf("Camera init failed %d\n", err);
@@ -302,20 +360,12 @@ void setup() {
   if (s != nullptr) {
     if (s->id.PID == OV3660_PID) {
       s->set_vflip(s, 1);
-      s->set_brightness(s, 1);
-      s->set_saturation(s, -2);
     }
-    // Low-light tuning: cap AGC gain now that the IR LED below supplies real illumination —
-    // relying on high sensor gain alone in the dark is what produces the grainy/noisy image.
-    s->set_gain_ctrl(s, 1);
-    s->set_gainceiling(s, GAINCEILING_4X);
-    s->set_exposure_ctrl(s, 1);
-    s->set_aec2(s, 1);
   }
 #ifdef LED_GPIO_NUM
-  pinMode(LED_GPIO_NUM, OUTPUT);
-  digitalWrite(LED_GPIO_NUM, nightVisionOn ? HIGH : LOW);
+  // already configured LOW above
 #endif
+  applyNightVisionHardware();
   startServer();
 }
 

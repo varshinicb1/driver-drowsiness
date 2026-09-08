@@ -15,12 +15,15 @@ class MonitorViewModelFactory(
     private val locationProvider: LocationProvider? = null,
     private val deviceBaseUrl: String? = null,
     private val deviceNetwork: android.net.Network? = null,
+    private val modelReady: Boolean = false,
+    private val modelLabel: String = "",
 ) : ViewModelProvider.Factory {
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         return MonitorViewModel(
             app, camera, perception, locationProvider = locationProvider,
             deviceBaseUrl = deviceBaseUrl, deviceNetwork = deviceNetwork,
+            modelReady = modelReady, modelLabel = modelLabel,
         ) as T
     }
 }

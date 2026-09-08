@@ -9,6 +9,7 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
+import com.drowsy.BuildConfig
 
 /**
  * Joins the ESP32's own WiFi AP by SSID/password, scoped to this app only — never touches the
@@ -37,14 +38,21 @@ class DeviceWifiConnector(context: Context) {
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d("DeviceWifiConnector", "onAvailable: $network")
+                if (BuildConfig.DEBUG) Log.d("DeviceWifiConnector", "onAvailable: $network")
                 // Do NOT bind all process traffic here — only explicit ESP32-facing calls should
                 // use this network; backend/internet sync must keep using the default route.
                 onConnected(network)
             }
-            override fun onUnavailable() { Log.d("DeviceWifiConnector", "onUnavailable (timeout)"); onFailed() }
-            override fun onLost(network: Network) { Log.d("DeviceWifiConnector", "onLost: $network") }
-            override fun onLosing(network: Network, maxMsToLive: Int) { Log.d("DeviceWifiConnector", "onLosing: $network in ${maxMsToLive}ms") }
+            override fun onUnavailable() {
+                if (BuildConfig.DEBUG) Log.d("DeviceWifiConnector", "onUnavailable (timeout)")
+                onFailed()
+            }
+            override fun onLost(network: Network) {
+                if (BuildConfig.DEBUG) Log.d("DeviceWifiConnector", "onLost: $network")
+            }
+            override fun onLosing(network: Network, maxMsToLive: Int) {
+                if (BuildConfig.DEBUG) Log.d("DeviceWifiConnector", "onLosing: $network in ${maxMsToLive}ms")
+            }
         }
         callback = cb
         cm.requestNetwork(request, cb, 15_000)

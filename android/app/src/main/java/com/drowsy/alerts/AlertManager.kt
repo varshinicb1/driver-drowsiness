@@ -76,12 +76,12 @@ class PhoneAlertManager(
                 val sr = 44100
                 val n = (sr * durationMs / 1000).toInt()
                 val buf = ShortArray(n) { i ->
-                    (Short.MAX_VALUE * 0.3 * sin(2 * Math.PI * freqHz * i / sr)).toInt().toShort()
+                    (Short.MAX_VALUE * 0.7 * sin(2 * Math.PI * freqHz * i / sr)).toInt().toShort()
                 }
                 track = AudioTrack.Builder()
                     .setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setUsage(AudioAttributes.USAGE_ALARM)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                             .build()
                     )

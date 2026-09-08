@@ -15,7 +15,9 @@ import com.drowsy.location.LocationProvider
 import com.drowsy.metrics.PerformanceMetrics
 import com.drowsy.perception.DriverPerceptionEngine
 import com.drowsy.perception.MediaPipeLandmarkerEngine
+import com.drowsy.perception.FrameEnhancer
 import com.drowsy.perception.Point2D
+import com.drowsy.camera.CameraFrame
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +26,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -58,6 +62,8 @@ data class UiState(
     val recentEvents: List<FatigueEvent> = emptyList(),
     val cameraConnection: CameraConnectionState = CameraConnectionState.IDLE,
     val streamLatencyMs: Long = -1,
+    val sceneAuto: Boolean = true,
+    val sceneLuma: Float = -1f,
 )
 
 class MonitorViewModel(
@@ -98,6 +104,7 @@ class MonitorViewModel(
 
     private var frameJob: Job? = null
     private var auxJob: Job? = null
+    private var scenePollJob: Job? = null
     private var activeEvent: FatigueEvent? = null
     private var maxScoreInEvent = 0
 
@@ -116,18 +123,27 @@ class MonitorViewModel(
                 .collect { frame ->
                     try {
                         metrics.onFrameReceived()
+                        val enhanced = FrameEnhancer.enhance(frame.bitmap)
+                        val procBmp = enhanced.bitmap
                         val previewBmp = try {
-                            frame.bitmap.copy(
-                                frame.bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888,
+                            procBmp.copy(
+                                procBmp.config ?: android.graphics.Bitmap.Config.ARGB_8888,
                                 false,
                             )
                         } catch (_: Exception) { null }
 
                         val t0 = System.currentTimeMillis()
+                        val procFrame = CameraFrame(procBmp, frame.timestampMs)
                         val pf = try {
-                            perception.processFrame(frame)
+                            when (val engine = perception) {
+                                is MediaPipeLandmarkerEngine -> engine.processFrame(procFrame, enhanced.luma)
+                                else -> engine.processFrame(procFrame)
+                            }
                         } catch (_: Exception) {
                             null
+                        }
+                        if (enhanced.enhanced && procBmp !== frame.bitmap && !procBmp.isRecycled) {
+                            procBmp.recycle()
                         }
                         if (pf == null) {
                             metrics.onDropped()
@@ -138,8 +154,8 @@ class MonitorViewModel(
                         val state = stateMachine.step(score, pf.timestampMs)
                         val repeatOk = (state == DriverState.FATIGUE || state == DriverState.HIGH_RISK) &&
                             fatigue.shouldRepeatAlert(pf.timestampMs)
-                        val alertFired = alerts.handleState(state, pf.timestampMs, repeatOk)
-                        if (alertFired) triggerDeviceAlert()
+                        val alertState = alerts.handleState(state, pf.timestampMs, repeatOk)
+                        if (alertState != null) triggerDeviceAlert(alertState)
 
                         val netCamInner = camera as? NetworkCameraSource
                         metrics.onInferenceDone(
@@ -171,6 +187,7 @@ class MonitorViewModel(
                                 modelReady = mp?.isReady ?: prev.modelReady,
                                 modelLabel = mp?.statusMessage ?: prev.modelLabel,
                                 streamLatencyMs = netCamInner?.lastLatencyMs() ?: prev.streamLatencyMs,
+                                sceneLuma = pf.sceneLuma,
                             ).also {
                                 if (previewBmp != null && oldBmp != null && oldBmp !== previewBmp && !oldBmp.isRecycled) {
                                     oldBmp.recycle()
@@ -192,6 +209,23 @@ class MonitorViewModel(
                     recentEvents = db.fatigueEventDao().recent(50),
                 )
             }
+            enableAutoSceneOnDevice()
+            refreshDeviceStatus()
+        }
+        if (!deviceBaseUrl.isNullOrBlank()) {
+            scenePollJob = viewModelScope.launch(Dispatchers.IO) {
+                while (isActive) {
+                    delay(8000)
+                    refreshDeviceStatus()
+                }
+            }
+        }
+    }
+
+    fun onForeground() {
+        if (deviceBaseUrl.isNullOrBlank()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            enableAutoSceneOnDevice()
             refreshDeviceStatus()
         }
     }
@@ -200,24 +234,30 @@ class MonitorViewModel(
         val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
         viewModelScope.launch(Dispatchers.IO) {
             deviceHttpMutex.withLock {
-                _ui.update { it.copy(nightVisionOn = on) }
                 try {
                     val req = Request.Builder().url("$base/night-vision?on=${if (on) 1 else 0}").get().build()
                     deviceHttpClient.newCall(req).execute().use { resp ->
                         if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
-                        val body = resp.body?.string().orEmpty()
-                        val actual = body.contains("\"nightVision\":true")
-                        _ui.update {
-                            it.copy(
-                                nightVisionOn = actual,
-                                deviceMessage = if (actual) "IR night vision on" else "IR night vision off",
-                            )
-                        }
+                        applyDeviceSceneBody(resp.body?.string().orEmpty())
                     }
                 } catch (e: Exception) {
-                    _ui.update { it.copy(deviceMessage = "Night vision failed: ${e.message}") }
+                    _ui.update { it.copy(deviceMessage = "Lighting failed: ${e.message}") }
                     refreshDeviceStatus()
                 }
+            }
+        }
+    }
+
+    fun setSceneAuto() {
+        val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            deviceHttpMutex.withLock {
+                try {
+                    val req = Request.Builder().url("$base/night-vision?on=auto").get().build()
+                    deviceHttpClient.newCall(req).execute().use { resp ->
+                        if (resp.isSuccessful) applyDeviceSceneBody(resp.body?.string().orEmpty())
+                    }
+                } catch (_: Exception) { }
             }
         }
     }
@@ -233,7 +273,7 @@ class MonitorViewModel(
             deviceHttpMutex.withLock {
                 _ui.update { it.copy(deviceMessage = "Triggering vehicle speaker…") }
                 try {
-                    val req = Request.Builder().url("$base/alert").get().build()
+                    val req = Request.Builder().url("$base/alert?type=fatigue").get().build()
                     deviceHttpClient.newCall(req).execute().use { resp ->
                         if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
                     }
@@ -284,6 +324,36 @@ class MonitorViewModel(
         }
     }
 
+    private suspend fun enableAutoSceneOnDevice() {
+        val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
+        deviceHttpMutex.withLock {
+            try {
+                val req = Request.Builder().url("$base/night-vision?on=auto").get().build()
+                deviceHttpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) applyDeviceSceneBody(resp.body?.string().orEmpty())
+                }
+            } catch (_: Exception) { }
+        }
+    }
+
+    private fun applyDeviceSceneBody(body: String) {
+        _ui.update {
+            it.copy(
+                nightVisionOn = body.contains("\"nightVision\":true"),
+                sceneAuto = !body.contains("\"sceneAuto\":false"),
+                sceneLuma = parseSceneLuma(body).takeIf { v -> v >= 0 } ?: it.sceneLuma,
+                deviceMessage = "",
+            )
+        }
+    }
+
+    private fun parseSceneLuma(body: String): Float {
+        val key = "\"sceneLuma\":"
+        val i = body.indexOf(key)
+        if (i < 0) return -1f
+        return body.substring(i + key.length).takeWhile { it.isDigit() || it == '.' }.toFloatOrNull() ?: -1f
+    }
+
     private suspend fun refreshDeviceStatus() {
         val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
         deviceHttpMutex.withLock {
@@ -291,10 +361,7 @@ class MonitorViewModel(
                 val req = Request.Builder().url("$base/status").get().build()
                 deviceHttpClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful) return
-                    val body = resp.body?.string().orEmpty()
-                    if (body.contains("nightVision")) {
-                        _ui.update { it.copy(nightVisionOn = body.contains("\"nightVision\":true")) }
-                    }
+                    applyDeviceSceneBody(resp.body?.string().orEmpty())
                 }
             } catch (_: Exception) { }
         }
@@ -305,6 +372,8 @@ class MonitorViewModel(
         frameJob = null
         auxJob?.cancel()
         auxJob = null
+        scenePollJob?.cancel()
+        scenePollJob = null
         camera.stop()
     }
 
@@ -312,19 +381,50 @@ class MonitorViewModel(
         OkHttpClient.Builder().apply {
             connectTimeout(5, TimeUnit.SECONDS)
             readTimeout(25, TimeUnit.SECONDS)
-            deviceNetwork?.let { socketFactory(it.socketFactory) }
+            // Default route only — matches manual DRIVER-CAM join on ColorOS.
         }.build()
     }
 
-    private fun triggerDeviceAlert() {
+    private var lastMicClipMs = 0L
+
+    private fun triggerDeviceAlert(state: DriverState) {
         val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
+        val type = when (state) {
+            DriverState.ATTENTION -> "attention"
+            DriverState.HIGH_RISK -> "high"
+            else -> "fatigue"
+        }
         viewModelScope.launch(Dispatchers.IO) {
             deviceHttpMutex.withLock {
                 try {
-                    val req = Request.Builder().url("$base/alert").get().build()
+                    val req = Request.Builder().url("$base/alert?type=$type").get().build()
                     deviceHttpClient.newCall(req).execute().close()
                 } catch (_: Exception) { }
             }
+            if (state == DriverState.HIGH_RISK) {
+                val now = System.currentTimeMillis()
+                if (now - lastMicClipMs > 15_000) {
+                    lastMicClipMs = now
+                    captureDeviceMicClip(2)
+                }
+            }
+        }
+    }
+
+    private suspend fun captureDeviceMicClip(seconds: Int) {
+        val base = deviceBaseUrl?.takeIf { it.isNotBlank() } ?: return
+        deviceHttpMutex.withLock {
+            try {
+                val req = Request.Builder().url("$base/audio-clip?sec=$seconds").get().build()
+                val bytes = deviceHttpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return
+                    resp.body?.bytes()
+                }
+                if (bytes == null || bytes.size < 44) return
+                val file = File(getApplication<Application>().cacheDir, "fatigue-evidence.wav")
+                file.writeBytes(bytes)
+                withContext(Dispatchers.Main) { playClip(file) }
+            } catch (_: Exception) { }
         }
     }
 

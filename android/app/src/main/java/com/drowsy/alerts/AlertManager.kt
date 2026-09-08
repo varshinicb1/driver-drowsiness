@@ -21,7 +21,8 @@ interface AlertManager {
     fun fatigueWarning(nowMs: Long)
     fun highRiskWarning(nowMs: Long)
     fun stop(nowMs: Long)
-    fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): Boolean
+    /** Returns the state that triggered an alert, or null if no alert fired. */
+    fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): DriverState?
 }
 
 class PhoneAlertManager(
@@ -58,20 +59,20 @@ class PhoneAlertManager(
         active = AlertLevel.NONE
     }
 
-    override fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): Boolean {
+    override fun handleState(state: DriverState, nowMs: Long, allowRepeat: Boolean): DriverState? {
         val prev = active
         return when {
             state == DriverState.HIGH_RISK && (prev != AlertLevel.HIGH_RISK || allowRepeat) -> {
-                highRiskWarning(nowMs); true
+                highRiskWarning(nowMs); state
             }
             state == DriverState.FATIGUE && (prev != AlertLevel.FATIGUE && prev != AlertLevel.HIGH_RISK || allowRepeat) -> {
-                fatigueWarning(nowMs); true
+                fatigueWarning(nowMs); state
             }
             state == DriverState.ATTENTION && beepOnAttention && (prev == AlertLevel.NONE || allowRepeat) -> {
-                attention(nowMs); true
+                attention(nowMs); state
             }
-            state == DriverState.NORMAL -> { stop(nowMs); false }
-            else -> false
+            state == DriverState.NORMAL -> { stop(nowMs); null }
+            else -> null
         }
     }
 

@@ -10,6 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <strings.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -24,12 +25,17 @@
 #define AP_CHANNEL 6
 #endif
 #ifndef AP_MAX_CLIENTS
-#define AP_MAX_CLIENTS 4
+#define AP_MAX_CLIENTS 1
 #endif
+
+static int frameWidth = 640;
+static int frameHeight = 480;
 
 static httpd_handle_t stream_httpd = NULL;
 static httpd_handle_t snapshot_httpd = NULL;
 static bool nightVisionOn = false;
+static bool sceneAuto = true;
+static float lastSceneLuma = 128.f;
 static SemaphoreHandle_t cameraMux = NULL;
 static SemaphoreHandle_t i2sMux = NULL;
 
@@ -40,10 +46,10 @@ static void withCameraMux(void (*fn)(void *), void *arg) {
   }
 }
 
-struct FreshFrameCtx { camera_fb_t **out; };
+struct FreshFrameCtx { camera_fb_t **out; int discard; };
 static void grabFreshFrameFn(void *arg) {
   auto *ctx = (FreshFrameCtx *)arg;
-  for (int i = 0; i < 2; i++) {
+  for (int i = 0; i < ctx->discard; i++) {
     camera_fb_t *stale = esp_camera_fb_get();
     if (!stale) { *ctx->out = nullptr; return; }
     esp_camera_fb_return(stale);
@@ -53,8 +59,21 @@ static void grabFreshFrameFn(void *arg) {
 
 static camera_fb_t *grabFreshFrame() {
   camera_fb_t *fb = nullptr;
-  FreshFrameCtx ctx = { &fb };
+  FreshFrameCtx ctx = { &fb, 1 };
   withCameraMux(grabFreshFrameFn, &ctx);
+  return fb;
+}
+
+struct StreamFrameCtx { camera_fb_t **out; };
+static void grabStreamFrameFn(void *arg) {
+  auto *ctx = (StreamFrameCtx *)arg;
+  *ctx->out = esp_camera_fb_get();
+}
+
+static camera_fb_t *grabStreamFrame() {
+  camera_fb_t *fb = nullptr;
+  StreamFrameCtx ctx = { &fb };
+  withCameraMux(grabStreamFrameFn, &ctx);
   return fb;
 }
 
@@ -75,24 +94,66 @@ static void applyNightVisionFn(void *) {
   s->set_dcw(s, 1);
   if (nightVisionOn) {
     s->set_aec2(s, 1);
-    s->set_gainceiling(s, GAINCEILING_8X);
-    s->set_ae_level(s, 0);
-    s->set_brightness(s, 0);
+    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_ae_level(s, 1);
+    s->set_brightness(s, 1);
     s->set_contrast(s, 0);
     s->set_saturation(s, -1);
+    s->set_wb_mode(s, 0);
+    s->set_aec_value(s, 400);
+    s->set_agc_gain(s, 8);
   } else {
-    // Daylight / room light: max auto-exposure lift, IR must stay off.
-    s->set_aec2(s, 0);
+    // Daylight / cabin: IR off — lift exposure so faces are not silhouetted.
+    s->set_aec2(s, 1);
     s->set_gainceiling(s, GAINCEILING_128X);
-    s->set_ae_level(s, 2);      // +2 EV
-    s->set_brightness(s, 2);  // max
-    s->set_contrast(s, 1);
-    s->set_saturation(s, 1);
+    s->set_ae_level(s, 2);
+    s->set_brightness(s, 2);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_wb_mode(s, 4); // indoor / home white balance
+    s->set_aec_value(s, 600);
+    s->set_agc_gain(s, 16);
+  }
+}
+
+static void warmupCameraExposure() {
+  for (int i = 0; i < 10; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(60);
   }
 }
 
 static void applyNightVisionHardware() {
   withCameraMux(applyNightVisionFn, nullptr);
+}
+
+static float estimateJpegLuma(camera_fb_t *fb) {
+  if (!fb || fb->len < 200) return 128.f;
+  uint32_t sum = 0;
+  uint32_t count = 0;
+  for (size_t i = 200; i + 64 < fb->len; i += 64) {
+    sum += fb->buf[i];
+    count++;
+  }
+  return count ? (float)sum / count : 128.f;
+}
+
+static void autoSceneAdjust() {
+  if (!sceneAuto) return;
+  camera_fb_t *fb = grabFreshFrame();
+  if (!fb) return;
+  float luma = estimateJpegLuma(fb);
+  esp_camera_fb_return(fb);
+  lastSceneLuma = luma;
+  bool wantIr = nightVisionOn;
+  if (luma < 72.f) wantIr = true;
+  else if (luma > 94.f) wantIr = false;
+  if (wantIr != nightVisionOn) {
+    nightVisionOn = wantIr;
+    applyNightVisionHardware();
+    Serial.printf("auto scene IR=%d luma=%.0f\n", nightVisionOn, luma);
+  }
 }
 
 #ifdef SPK_BCLK_GPIO_NUM
@@ -126,40 +187,68 @@ static bool ensureSpeaker() {
 
 // Rising two-tone beep (900Hz -> 1400Hz), stereo-duplicated so it plays regardless of the
 // MAX98357's L/R gain-pin strapping.
-static void playAlertTone() {
+static void playToneBurst(int freqHz, int toneMs) {
+  const int sampleRate = 16000;
+  int period = sampleRate / freqHz;
+  int samples = (sampleRate * toneMs) / 1000;
+  int16_t buf[128];
+  int written = 0;
+  while (written < samples) {
+    int chunkSamples = min(128, samples - written);
+    for (int i = 0; i < chunkSamples; i++) {
+      int idx = written + i;
+      bool high = (idx % period) < (period / 2);
+      buf[i] = high ? 22000 : -22000;
+    }
+    size_t bytesWritten = 0;
+    i2s_write(I2S_NUM_1, buf, chunkSamples * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
+    written += chunkSamples;
+  }
+}
+
+static void playAlertToneTyped(int type) {
   if (i2sMux && xSemaphoreTake(i2sMux, pdMS_TO_TICKS(5000)) != pdTRUE) return;
   if (!ensureSpeaker()) { xSemaphoreGive(i2sMux); return; }
-  const int sampleRate = 16000;
-  const int freqs[2] = {900, 1400};
-  const int toneMs = 220;
-  int16_t buf[128];
-  for (int t = 0; t < 2; t++) {
-    int period = sampleRate / freqs[t];
-    int samples = (sampleRate * toneMs) / 1000;
-    int written = 0;
-    while (written < samples) {
-      int chunkSamples = min(128, samples - written);
-      for (int i = 0; i < chunkSamples; i++) {
-        int idx = written + i;
-        bool high = (idx % period) < (period / 2);
-        buf[i] = high ? 22000 : -22000;
-      }
-      size_t bytesWritten = 0;
-      i2s_write(I2S_NUM_1, buf, chunkSamples * sizeof(int16_t), &bytesWritten, portMAX_DELAY);
-      written += chunkSamples;
+  if (type == 0) {
+    // attention — single short chirp
+    playToneBurst(700, 120);
+  } else if (type == 2) {
+    // high risk — three rapid high tones
+    for (int i = 0; i < 3; i++) {
+      playToneBurst(1200, 160);
+      delay(30);
     }
+  } else {
+    // fatigue — rising two-tone
+    playToneBurst(900, 220);
     delay(40);
+    playToneBurst(1400, 220);
   }
   xSemaphoreGive(i2sMux);
 }
 
-static void alertTask(void *) {
-  playAlertTone();
+struct AlertTaskArg { int type; };
+static void alertTask(void *param) {
+  int type = param ? ((AlertTaskArg *)param)->type : 1;
+  playAlertToneTyped(type);
+  if (param) free(param);
   vTaskDelete(NULL);
 }
 
 static esp_err_t alert_handler(httpd_req_t *req) {
-  xTaskCreate(alertTask, "alert", 4096, NULL, 1, NULL);
+  int type = 1;
+  char query[32];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    char val[16];
+    if (httpd_query_key_value(query, "type", val, sizeof(val)) == ESP_OK) {
+      if (strcasecmp(val, "attention") == 0) type = 0;
+      else if (strcasecmp(val, "high") == 0) type = 2;
+      else type = 1;
+    }
+  }
+  auto *arg = (AlertTaskArg *)malloc(sizeof(AlertTaskArg));
+  if (arg) { arg->type = type; xTaskCreate(alertTask, "alert", 4096, arg, 1, NULL); }
+  else { xTaskCreate(alertTask, "alert", 4096, NULL, 1, NULL); }
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -250,12 +339,21 @@ static esp_err_t audioclip_handler(httpd_req_t *req) {
 }
 #endif
 
+static esp_err_t ping_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+  return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
-  char buf[256];
+  char buf[320];
   snprintf(buf, sizeof(buf),
-    "{\"uptime\":%lu,\"width\":%d,\"height\":%d,\"fps\":20,\"clients\":%d,\"nightVision\":%s}",
-    millis()/1000, 480, 320, WiFi.softAPgetStationNum(),
-    nightVisionOn ? "true" : "false");
+    "{\"uptime\":%lu,\"width\":%d,\"height\":%d,\"fps\":15,\"clients\":%d,"
+    "\"nightVision\":%s,\"sceneAuto\":%s,\"sceneLuma\":%.1f}",
+    millis()/1000, frameWidth, frameHeight, WiFi.softAPgetStationNum(),
+    nightVisionOn ? "true" : "false",
+    sceneAuto ? "true" : "false",
+    lastSceneLuma);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, strlen(buf));
 }
@@ -276,8 +374,8 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   char part_hdr[64];
   while (true) {
-    camera_fb_t *fb = grabFreshFrame();
-    if (!fb) continue;
+    camera_fb_t *fb = grabStreamFrame();
+    if (!fb) { delay(1); continue; }
     snprintf(part_hdr, sizeof(part_hdr),
       "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
     if (httpd_resp_send_chunk(req, part_hdr, strlen(part_hdr)) != ESP_OK) { esp_camera_fb_return(fb); break; }
@@ -292,16 +390,26 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 
 #ifdef LED_GPIO_NUM
 static esp_err_t nightvision_handler(httpd_req_t *req) {
-  char query[16];
+  char query[24];
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    char val[4];
+    char val[8];
     if (httpd_query_key_value(query, "on", val, sizeof(val)) == ESP_OK) {
-      nightVisionOn = atoi(val) != 0;
-      applyNightVisionHardware();
+      if (strcasecmp(val, "auto") == 0) {
+        sceneAuto = true;
+        autoSceneAdjust();
+      } else {
+        sceneAuto = false;
+        nightVisionOn = atoi(val) != 0;
+        applyNightVisionHardware();
+      }
     }
   }
-  char buf[32];
-  snprintf(buf, sizeof(buf), "{\"nightVision\":%s}", nightVisionOn ? "true" : "false");
+  char buf[64];
+  snprintf(buf, sizeof(buf),
+    "{\"nightVision\":%s,\"sceneAuto\":%s,\"sceneLuma\":%.1f}",
+    nightVisionOn ? "true" : "false",
+    sceneAuto ? "true" : "false",
+    lastSceneLuma);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
@@ -311,15 +419,17 @@ void startServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.lru_purge_enable = true;
-  config.max_open_sockets = 4;
-  config.recv_wait_timeout = 2;
-  config.send_wait_timeout = 2;
-  config.stack_size = 8192;
+  config.max_open_sockets = 7;
+  config.recv_wait_timeout = 5;
+  config.send_wait_timeout = 5;
+  config.stack_size = 10240;
   httpd_handle_t server = NULL;
   if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_uri_t s0 = {.uri="/ping", .method=HTTP_GET, .handler=ping_handler, .user_ctx=NULL};
     httpd_uri_t s1 = {.uri="/status", .method=HTTP_GET, .handler=status_handler, .user_ctx=NULL};
     httpd_uri_t s2 = {.uri="/snapshot", .method=HTTP_GET, .handler=snapshot_handler, .user_ctx=NULL};
     httpd_uri_t s3 = {.uri="/stream", .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL};
+    httpd_register_uri_handler(server, &s0);
     httpd_register_uri_handler(server, &s1);
     httpd_register_uri_handler(server, &s2);
     httpd_register_uri_handler(server, &s3);
@@ -340,16 +450,21 @@ void startServer() {
 
 void setup() {
   Serial.begin(115200);
+  delay(1500); // USB-CDC on ESP32-S3: wait for host serial
   cameraMux = xSemaphoreCreateMutex();
   i2sMux = xSemaphoreCreateMutex();
 #ifdef LED_GPIO_NUM
   pinMode(LED_GPIO_NUM, OUTPUT);
   digitalWrite(LED_GPIO_NUM, LOW); // IR off before camera init
 #endif
-  WiFi.setSleep(false); // AP latency: keep radio awake
-  // Wi-Fi — secrets.h optional; defaults to direct demo AP (§18, docs/hardware.md:3)
-  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
-  Serial.printf("AP %s at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  const bool apOk = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, AP_MAX_CLIENTS);
+  delay(100);
+  Serial.printf("AP %s %s at %s ch=%d clients=%d\n",
+    AP_SSID, apOk ? "OK" : "FAIL", WiFi.softAPIP().toString().c_str(), AP_CHANNEL, AP_MAX_CLIENTS);
 #ifdef USE_STA
 #if USE_STA
   if (String(STA_SSID).length() > 0) {
@@ -386,12 +501,17 @@ void setup() {
   cfg.pin_sccb_sda = 26; cfg.pin_sccb_scl = 27; cfg.pin_pwdn = 32; cfg.pin_reset = -1;
 #endif
   cfg.xclk_freq_hz = 20000000; cfg.pixel_format = PIXFORMAT_JPEG;
-  // HVGA = faster encode + transfer than VGA; enough for face landmarks at ~30 cm.
-  cfg.frame_size = FRAMESIZE_HVGA;
-  cfg.jpeg_quality = 18; // 0-63 lower=better; 18 ≈ fast ~50% JPEG, good for low latency
-  cfg.fb_count = 2; cfg.fb_location = CAMERA_FB_IN_PSRAM; cfg.grab_mode = CAMERA_GRAB_LATEST;
+  // VGA 640×480 — best balance of face detail and WiFi throughput on ESP32-S3 AP.
+  cfg.frame_size = FRAMESIZE_VGA;
+  cfg.jpeg_quality = 12;
+  cfg.fb_count = 3;
+  cfg.fb_location = CAMERA_FB_IN_PSRAM; cfg.grab_mode = CAMERA_GRAB_LATEST;
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) Serial.printf("Camera init failed %d\n", err);
+  else {
+    frameWidth = 640;
+    frameHeight = 480;
+  }
 
   sensor_t *s = esp_camera_sensor_get();
   if (s != nullptr) {
@@ -403,7 +523,16 @@ void setup() {
   // already configured LOW above
 #endif
   applyNightVisionHardware();
+  warmupCameraExposure();
   startServer();
 }
 
-void loop() { delay(1000); }
+void loop() {
+  static uint32_t lastAuto = 0;
+  uint32_t now = millis();
+  if (now - lastAuto >= 1500) {
+    lastAuto = now;
+    autoSceneAdjust();
+  }
+  delay(20);
+}

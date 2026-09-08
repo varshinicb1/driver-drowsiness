@@ -19,10 +19,10 @@ ESP32-S3 is **only camera/transport** for V1 (§17). No fatigue AI on device.
 ```
 GET /stream       → multipart/x-mixed-replace MJPEG
 GET /snapshot     → single JPEG
-GET /status       → JSON { uptime, fps, width, height, clients, nightVision }
+GET /status       → JSON { uptime, fps, width, height, clients, nightVision, sceneAuto, sceneLuma }
 GET /alert        → two-tone beep on the MAX98357 speaker (DFR1154)
 GET /audio-clip?sec=N → WAV from onboard PDM mic (1–8 s)
-GET /night-vision?on=0|1 → IR LED (GPIO47) + low-light AGC
+GET /night-vision?on=0|1|auto → IR LED (GPIO47) + exposure profile; `auto` toggles IR from scene brightness (~1.5 s)
 ```
 
 ## Flash

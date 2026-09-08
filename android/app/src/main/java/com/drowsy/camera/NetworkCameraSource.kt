@@ -13,22 +13,25 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
-import java.net.HttpURLConnection
-import java.net.URL
+import okhttp3.ConnectionPool
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
 enum class CameraConnectionState { IDLE, CONNECTING, LIVE, OFFLINE }
 
 /**
- * Low-latency snapshot polling against ESP32 /snapshot (Connection: close per frame).
+ * Vehicle camera client — persistent MJPEG over OkHttp for ultra-low latency,
+ * snapshot fallback when the stream drops.
  */
 class NetworkCameraSource(
     private val baseUrl: String,
-    private val preferMjpeg: Boolean = false,
-    private val reconnectDelayMs: Long = 800,
-    private val connectTimeoutMs: Int = 2000,
-    private val readTimeoutMs: Int = 2000,
-    private val snapshotTargetFps: Int = 15,
+    private val preferMjpeg: Boolean = true,
+    private val reconnectDelayMs: Long = 600,
+    private val connectTimeoutMs: Int = 5000,
+    private val readTimeoutMs: Int = 8000,
+    private val snapshotTargetFps: Int = 12,
     private val network: android.net.Network? = null,
 ) : CameraSource {
 
@@ -42,8 +45,25 @@ class NetworkCameraSource(
     @Volatile private var latencyMs: Long = -1
     fun lastLatencyMs(): Long = latencyMs
 
-    private fun openConn(url: URL): HttpURLConnection =
-        (network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection
+    private val streamClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .retryOnConnectionFailure(true)
+            .connectionPool(ConnectionPool(1, 1, TimeUnit.MINUTES))
+            .apply { network?.let { socketFactory(it.socketFactory) } }
+            .build()
+    }
+
+    private val snapshotClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(connectTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .readTimeout(readTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            .retryOnConnectionFailure(true)
+            .connectionPool(ConnectionPool(2, 30, TimeUnit.SECONDS))
+            .apply { network?.let { socketFactory(it.socketFactory) } }
+            .build()
+    }
 
     override fun start() {
         isRunning = true
@@ -53,32 +73,66 @@ class NetworkCameraSource(
     override fun stop() {
         isRunning = false
         _connection.value = CameraConnectionState.IDLE
+        streamClient.dispatcher.executorService.shutdown()
+        snapshotClient.dispatcher.executorService.shutdown()
     }
 
     override fun frames(): Flow<CameraFrame> = flow {
         if (BuildConfig.DEBUG) {
-            Log.d(TAG, "frames mode=${if (preferMjpeg) "mjpeg" else "snapshot"} url=$baseUrl")
+            Log.d(TAG, "mode=${if (preferMjpeg) "mjpeg" else "snapshot"} url=$baseUrl")
         }
-        var offlineStreak = 0
+        var failures = 0
         while (isRunning) {
+            coroutineContext.ensureActive()
             try {
-                if (preferMjpeg) emitMjpeg(this) else emitSnapshotLoop(this)
-                offlineStreak = 0
+                if (preferMjpeg) {
+                    emitMjpegOkHttp(this)
+                } else {
+                    emitSnapshotLoop(this)
+                }
+                failures = 0
             } catch (e: Exception) {
-                offlineStreak++
-                _connection.value = CameraConnectionState.OFFLINE
-                if (BuildConfig.DEBUG) Log.w(TAG, "camera loop: ${e.message}")
-                delay(reconnectDelayMs.coerceAtMost(3000))
+                failures++
+                if (failures >= 2) _connection.value = CameraConnectionState.OFFLINE
+                if (BuildConfig.DEBUG) Log.w(TAG, "stream error: ${e.message}")
+                if (preferMjpeg && failures <= 3) {
+                    try { emitSnapshotLoop(this) } catch (_: Exception) {}
+                }
+                delay(reconnectDelayMs)
             }
         }
     }.flowOn(Dispatchers.IO)
 
-    private fun configure(conn: HttpURLConnection) {
-        conn.connectTimeout = connectTimeoutMs
-        conn.readTimeout = readTimeoutMs
-        conn.useCaches = false
-        conn.setRequestProperty("Connection", "close")
-        conn.setRequestProperty("Cache-Control", "no-cache")
+    private suspend fun emitMjpegOkHttp(collector: kotlinx.coroutines.flow.FlowCollector<CameraFrame>) {
+        val url = streamUrl("/stream")
+        val req = Request.Builder()
+            .url(url)
+            .header("Accept", "multipart/x-mixed-replace")
+            .header("Connection", "keep-alive")
+            .header("Cache-Control", "no-cache")
+            .build()
+        val tConnect = System.currentTimeMillis()
+        streamClient.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
+            val body = resp.body ?: throw IllegalStateException("empty body")
+            val reader = MjpegStreamReader(body.source())
+            val opts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+                inMutable = false
+            }
+            var frames = 0
+            while (isRunning) {
+                coroutineContext.ensureActive()
+                val jpeg = reader.nextJpeg() ?: break
+                val t0 = System.currentTimeMillis()
+                val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
+                    ?: continue
+                latencyMs = if (frames == 0) t0 - tConnect else System.currentTimeMillis() - t0
+                frames++
+                _connection.value = CameraConnectionState.LIVE
+                collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
+            }
+        }
     }
 
     private suspend fun emitSnapshotLoop(collector: kotlinx.coroutines.flow.FlowCollector<CameraFrame>) {
@@ -92,27 +146,29 @@ class NetworkCameraSource(
         while (isRunning) {
             coroutineContext.ensureActive()
             val t0 = System.currentTimeMillis()
-            var conn: HttpURLConnection? = null
             try {
-                val url = URL("$baseUrl/snapshot?t=${System.currentTimeMillis()}&n=${seq++}")
-                conn = openConn(url).apply {
-                    requestMethod = "GET"
-                    configure(this)
+                val url = streamUrl("/snapshot?t=${System.currentTimeMillis()}&n=${seq++}")
+                val req = Request.Builder().url(url).get()
+                    .header("Connection", "close")
+                    .header("Cache-Control", "no-cache")
+                    .build()
+                val bytes = snapshotClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) throw IllegalStateException("HTTP ${resp.code}")
+                    resp.body?.bytes() ?: throw IllegalStateException("empty")
                 }
-                if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
-                val bytes = conn.inputStream.use { it.readBytes() }
-                if (bytes.size < 100) throw IllegalStateException("empty frame")
+                if (bytes.size < 100) throw IllegalStateException("tiny frame")
                 val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
                     ?: throw IllegalStateException("decode failed")
                 latencyMs = System.currentTimeMillis() - t0
                 failures = 0
                 _connection.value = CameraConnectionState.LIVE
                 collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 failures++
-                if (failures >= 3) _connection.value = CameraConnectionState.OFFLINE
-            } finally {
-                try { conn?.disconnect() } catch (_: Exception) {}
+                if (failures >= 3) {
+                    _connection.value = CameraConnectionState.OFFLINE
+                    throw e
+                }
             }
             val elapsed = System.currentTimeMillis() - t0
             val sleep = frameGapMs - elapsed
@@ -120,51 +176,9 @@ class NetworkCameraSource(
         }
     }
 
-    private suspend fun emitMjpeg(collector: kotlinx.coroutines.flow.FlowCollector<CameraFrame>) {
-        val url = URL("$baseUrl/stream")
-        var conn: HttpURLConnection? = null
-        try {
-            conn = openConn(url).apply {
-                requestMethod = "GET"
-                configure(this)
-                readTimeout = 4000
-                setRequestProperty("Accept", "multipart/x-mixed-replace")
-            }
-            conn.connect()
-            if (conn.responseCode != 200) throw IllegalStateException("HTTP ${conn.responseCode}")
-            val input = conn.inputStream
-            val buffer = ByteArray(16 * 1024)
-            var leftover = ByteArray(0)
-            val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.ARGB_8888 }
-            while (isRunning) {
-                coroutineContext.ensureActive()
-                val n = try { input.read(buffer) } catch (_: Exception) { break }
-                if (n <= 0) break
-                leftover = leftover + buffer.copyOfRange(0, n)
-                var lastStart = -1
-                var lastEnd = -1
-                var i = 0
-                while (i < leftover.size - 1) {
-                    if (leftover[i] == 0xFF.toByte() && leftover[i + 1] == 0xD8.toByte()) lastStart = i
-                    if (leftover[i] == 0xFF.toByte() && leftover[i + 1] == 0xD9.toByte() && lastStart >= 0) lastEnd = i + 1
-                    i++
-                }
-                if (lastStart >= 0 && lastEnd > lastStart) {
-                    val jpeg = leftover.copyOfRange(lastStart, lastEnd + 1)
-                    leftover = if (lastEnd + 1 < leftover.size) leftover.copyOfRange(lastEnd + 1, leftover.size) else ByteArray(0)
-                    val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
-                    if (bmp != null) {
-                        _connection.value = CameraConnectionState.LIVE
-                        collector.emit(CameraFrame(bmp, System.currentTimeMillis()))
-                    }
-                } else if (leftover.size > 128 * 1024) {
-                    leftover = leftover.copyOfRange(leftover.size - 32 * 1024, leftover.size)
-                }
-            }
-        } finally {
-            try { conn?.inputStream?.close() } catch (_: Exception) {}
-            try { conn?.disconnect() } catch (_: Exception) {}
-        }
+    private fun streamUrl(path: String): String {
+        val base = baseUrl.trimEnd('/')
+        return "$base$path"
     }
 
     companion object {

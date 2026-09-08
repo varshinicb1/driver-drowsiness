@@ -50,4 +50,6 @@ data class PerceptionFrame(
     val faceOrientation: HeadPose? = null,
     /** Normalized 0..1 landmarks for UI overlay only; fatigue ignores this. */
     val landmarks: List<Point2D>? = null,
+    /** Center luma 0-255 for adaptive thresholds (§11). */
+    val sceneLuma: Float = 128f,
 )

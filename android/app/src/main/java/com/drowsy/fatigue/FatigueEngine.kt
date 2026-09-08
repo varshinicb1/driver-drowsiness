@@ -13,8 +13,13 @@ fun scoreSnapshot(s: TemporalSnapshot, th: FatigueThresholds): Int {
     val gazeScore = s.gazeOffRatio * 100f
     var raw = th.wPerclos * perclosScore + th.wMaxClosure * closureScore + th.wYawn * yawnScore + th.wHeadPose * headScore + th.wGaze * gazeScore
     if (s.prolongedClosure && s.maxClosureMs > 1000) raw = min(100f, raw + 10f)
-    if (s.trackingQualityMean < th.trackingQualityGate && th.trackingQualityGate > 0) {
-        raw *= (s.trackingQualityMean / th.trackingQualityGate)
+    val gate = when {
+        s.meanSceneLuma < 55f -> th.trackingQualityGate * 0.65f
+        s.meanSceneLuma < 80f -> th.trackingQualityGate * 0.82f
+        else -> th.trackingQualityGate
+    }
+    if (s.trackingQualityMean < gate && gate > 0) {
+        raw *= (s.trackingQualityMean / gate)
     }
     return raw.roundToInt().coerceIn(0, 100)
 }

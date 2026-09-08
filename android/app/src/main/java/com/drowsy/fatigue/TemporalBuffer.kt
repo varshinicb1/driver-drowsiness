@@ -12,6 +12,7 @@ data class TemporalSnapshot(
     val headAbnormalRatio: Float,
     val gazeOffRatio: Float,
     val trackingQualityMean: Float,
+    val meanSceneLuma: Float = 128f,
     val eyeClosure: Boolean,
     val prolongedClosure: Boolean,
 )
@@ -53,7 +54,7 @@ class TemporalFeatureBuffer(
     }
 
     fun snapshot(nowMs: Long): TemporalSnapshot {
-        if (frames.isEmpty()) return TemporalSnapshot(0f,0,0f,0,0,0f,0f,0f,false,false)
+        if (frames.isEmpty()) return TemporalSnapshot(0f, 0, 0f, 0, 0, 0f, 0f, 0f, 128f, false, false)
         val total = frames.size
         val closed = frames.count { it.eye?.eyesClosed == true && it.facePresent }
         val perclos = closed.toFloat() / total
@@ -87,11 +88,12 @@ class TemporalFeatureBuffer(
         val headAb = frames.count { it.headPose?.abnormal == true }.toFloat() / total
         val gazeOff = frames.count { (it.gaze?.forwardProb ?: 1f) < 0.5f }.toFloat() / total
         val tq = frames.map { it.trackingQuality }.average().toFloat()
+        val meanLuma = frames.map { it.sceneLuma }.average().toFloat()
         val currentlyClosed = frames.last().let { it.eye?.eyesClosed == true && it.facePresent }
         val prolonged = maxClosure >= pconfig.eyeClosureMinMs
         var yawnCount = yawnEvents.size
         yawnStartMs?.let { if (nowMs - it >= pconfig.marYawnMinDurationMs) yawnCount++ }
-        return TemporalSnapshot(perclos, maxClosure, meanEar, blinkCount, yawnCount, headAb, gazeOff, tq, currentlyClosed, prolonged)
+        return TemporalSnapshot(perclos, maxClosure, meanEar, blinkCount, yawnCount, headAb, gazeOff, tq, meanLuma, currentlyClosed, prolonged)
     }
 
     fun size() = frames.size

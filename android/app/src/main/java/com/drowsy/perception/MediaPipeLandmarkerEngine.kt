@@ -56,16 +56,27 @@ class MediaPipeLandmarkerEngine(
         }
     }
 
-    override fun processFrame(frame: CameraFrame): PerceptionFrame? {
+    override fun processFrame(frame: CameraFrame): PerceptionFrame? =
+        processFrame(frame, FrameEnhancer.estimateCenterLuma(frame.bitmap))
+
+    fun processFrame(frame: CameraFrame, sceneLuma: Float): PerceptionFrame? {
         val lm = landmarker ?: run {
-            if (!initialize()) return fallbackNoFace(frame.timestampMs)
+            if (!initialize()) return fallbackNoFace(frame.timestampMs, sceneLuma)
             landmarker
-        } ?: return fallbackNoFace(frame.timestampMs)
+        } ?: return fallbackNoFace(frame.timestampMs, sceneLuma)
+
+        val earTh = FrameEnhancer.adaptiveEarThreshold(earClosedThreshold, sceneLuma)
+        val marTh = FrameEnhancer.adaptiveMarThreshold(marYawnThreshold, sceneLuma)
+        val detectConf = when {
+            sceneLuma < 50f -> 0.35f
+            sceneLuma < 75f -> 0.42f
+            else -> minFaceDetectionConfidence
+        }
 
         return try {
             val src = frame.bitmap
             val argb = if (src.config == Bitmap.Config.ARGB_8888) src
-                else src.copy(Bitmap.Config.ARGB_8888, false) ?: return fallbackNoFace(frame.timestampMs)
+                else src.copy(Bitmap.Config.ARGB_8888, false) ?: return fallbackNoFace(frame.timestampMs, sceneLuma)
             val mpImage = BitmapImageBuilder(argb).build()
             var ts = frame.timestampMs
             if (ts <= lastVideoTs) ts = lastVideoTs + 1
@@ -75,23 +86,23 @@ class MediaPipeLandmarkerEngine(
             } finally {
                 try { mpImage.close() } catch (_: Exception) {}
             }
-            // FaceLandmarkerResult has no detections()/categories() — presence is "faceLandmarks() non-empty".
             val landmarks = result.faceLandmarks().firstOrNull()
             if (landmarks == null || landmarks.isEmpty()) {
-                return PerceptionFrame(false, 0f, 0f, 0.1f, timestampMs = frame.timestampMs)
+                return PerceptionFrame(false, 0f, 0f, 0.1f, timestampMs = frame.timestampMs, sceneLuma = sceneLuma)
             }
-            val faceConf = minFaceDetectionConfidence.coerceAtLeast(0.7f)
+            val faceConf = detectConf.coerceAtLeast(0.7f)
             val pts = landmarks.map { Point2D(it.x(), it.y()) }
-            val pf = geometry.process(pts, frame.timestampMs, faceConf)
+            val pf = geometry.process(pts, frame.timestampMs, faceConf, earTh, marTh)
             val tq = (faceConf * (pts.size / 468f)).coerceIn(0f, 1f)
-            pf.copy(landmarkConfidence = tq, trackingQuality = tq, landmarks = pts)
+            pf.copy(landmarkConfidence = tq, trackingQuality = tq, landmarks = pts, sceneLuma = sceneLuma)
         } catch (e: Exception) {
             initError = e
-            fallbackNoFace(frame.timestampMs)
+            fallbackNoFace(frame.timestampMs, sceneLuma)
         }
     }
 
-    private fun fallbackNoFace(ts: Long) = PerceptionFrame(false, 0f, 0f, 0f, timestampMs = ts)
+    private fun fallbackNoFace(ts: Long, luma: Float = 128f) =
+        PerceptionFrame(false, 0f, 0f, 0f, timestampMs = ts, sceneLuma = luma)
 
     fun close() { try { landmarker?.close() } catch (_: Exception) {}; landmarker = null }
 }

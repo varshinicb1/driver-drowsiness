@@ -2,7 +2,6 @@ package com.drowsy.ui
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -34,13 +33,15 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.drowsy.camera.AndroidFrontCameraSource
 import com.drowsy.camera.CameraConnectionState
 import com.drowsy.camera.CameraSource
 import com.drowsy.fatigue.DriverState
 import com.drowsy.location.FusedLocationProvider
-import com.drowsy.network.DeviceWifiConnector
+import com.drowsy.network.DeviceWifiKeeper
 import com.drowsy.perception.MediaPipeLandmarkerEngine
 import com.drowsy.perception.Point2D
 import com.drowsy.ui.theme.DrowsyPalette
@@ -51,7 +52,7 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
-    private val wifiConnector by lazy { DeviceWifiConnector(applicationContext) }
+    private var wifiKeeper: DeviceWifiKeeper? = null
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
         if (granted[Manifest.permission.CAMERA] == true) recreate()
@@ -64,7 +65,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val cfg = readConfig()
-        val source = cfg?.optString("camera_source", "front") ?: "front"
+        val source = cfg?.optString("camera_source", "network") ?: "network"
         val deviceBaseUrl = (cfg?.optString("network_camera_url", "") ?: "").ifBlank { "http://192.168.4.1" }
         val apSsid = cfg?.optString("device_ap_ssid", "DRIVER-CAM") ?: "DRIVER-CAM"
         val apPassword = cfg?.optString("device_ap_password", "drowsy123") ?: "drowsy123"
@@ -76,24 +77,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             DrowsyTheme {
                 var ready by remember { mutableStateOf<Pair<CameraSource, android.net.Network?>?>(null) }
-                var wifiError by remember { mutableStateOf<String?>(null) }
                 var connecting by remember { mutableStateOf(source == "network") }
 
+                val offlineHint = if (source == "network") {
+                    "Join \"$apSsid\" in Wi-Fi settings (password: $apPassword). Tap Stay connected when warned about no internet."
+                } else null
+
                 LaunchedEffect(Unit) {
-                    if (source == "network" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        wifiConnector.connect(
-                            apSsid, apPassword,
-                            onConnected = { network ->
-                                ready = com.drowsy.camera.NetworkCameraSource(deviceBaseUrl, network = network) to network
-                                connecting = false
-                                wifiError = null
-                            },
-                            onFailed = {
-                                wifiError = "Join Wi-Fi \"$apSsid\" manually in Settings, then reopen the app."
-                                ready = com.drowsy.camera.NetworkCameraSource(deviceBaseUrl) to null
-                                connecting = false
-                            },
-                        )
+                    if (source == "network") {
+                        ready = com.drowsy.camera.NetworkCameraSource(deviceBaseUrl, preferMjpeg = true) to null
+                        connecting = false
+                        wifiKeeper = DeviceWifiKeeper(applicationContext, deviceBaseUrl, apSsid, apPassword)
+                        wifiKeeper?.start()
                     } else {
                         ready = createCameraSource(source, deviceBaseUrl) to null
                         connecting = false
@@ -112,18 +107,29 @@ class MainActivity : ComponentActivity() {
                             modelReady, modelLabel,
                         )
                     }
+                    val activity = this@MainActivity
                     val vm: MonitorViewModel = viewModel(factory = factory)
                     LaunchedEffect(camera) { if (hasPermissions()) vm.start() }
-                    DisposableEffect(camera) { onDispose { vm.stop() } }
-                    AppShell(vm, wifiError)
+                    DisposableEffect(vm) {
+                        val observer = LifecycleEventObserver { _, event ->
+                            if (event == Lifecycle.Event.ON_RESUME) vm.onForeground()
+                        }
+                        activity.lifecycle.addObserver(observer)
+                        onDispose {
+                            activity.lifecycle.removeObserver(observer)
+                            vm.stop()
+                        }
+                    }
+                    AppShell(vm, offlineHint)
                 }
             }
         }
     }
 
     override fun onDestroy() {
+        wifiKeeper?.stop()
+        wifiKeeper = null
         super.onDestroy()
-        wifiConnector.disconnect()
     }
 
     private fun readConfig(): org.json.JSONObject? = try {
@@ -213,7 +219,7 @@ fun MonitorScreen(vm: MonitorViewModel, wifiHint: String?) {
         StatusCard(ui)
         if (com.drowsy.BuildConfig.ENABLE_PERF_OVERLAY) PerfOverlay(perf)
         if (ui.vehicleDevice) {
-            NightVisionRow(ui.nightVisionOn) { vm.setNightVision(it) }
+            AutoSceneRow(ui)
         }
         if (ui.state == DriverState.FATIGUE || ui.state == DriverState.HIGH_RISK) {
             FatigueAlertCard(ui)
@@ -251,7 +257,7 @@ private fun ConnectionBanner(state: CameraConnectionState, latencyMs: Long, wifi
             Spacer(Modifier.width(8.dp))
             Column {
                 Text(text, color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Medium)
-                if (wifiHint != null) {
+                if (wifiHint != null && state == CameraConnectionState.OFFLINE) {
                     Text(wifiHint, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(0.7f))
                 }
             }
@@ -305,7 +311,7 @@ private fun ModelStatusRow(ui: UiState) {
     val ok = ui.modelReady
     AssistChip(
         onClick = {},
-        label = { Text(if (ok) "Face model ready" else "Face model missing") },
+        label = { Text(if (ok) "Face model ready · adaptive lighting" else "Face model missing") },
         leadingIcon = {},
         colors = AssistChipDefaults.assistChipColors(
             containerColor = if (ok) DrowsyPalette.normal.copy(0.2f) else MaterialTheme.colorScheme.error.copy(0.2f),
@@ -337,14 +343,21 @@ private fun MetricChip(label: String, value: String) {
 }
 
 @Composable
-private fun NightVisionRow(on: Boolean, onToggle: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-        Column {
-            Text("Night vision (IR)", style = MaterialTheme.typography.titleSmall)
-            Text("Off in daylight", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface.copy(0.6f))
-        }
-        Switch(checked = on, onCheckedChange = onToggle)
+private fun AutoSceneRow(ui: UiState) {
+    val mode = when {
+        ui.sceneAuto && ui.nightVisionOn -> "Auto · night (IR on)"
+        ui.sceneAuto -> "Auto · daylight"
+        ui.nightVisionOn -> "Manual · IR on"
+        else -> "Manual · daylight"
     }
+    val luma = if (ui.sceneLuma >= 0) " · brightness ${ui.sceneLuma.toInt()}" else ""
+    AssistChip(
+        onClick = {},
+        label = { Text("Lighting: $mode$luma") },
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+    )
 }
 
 @Composable
@@ -423,7 +436,8 @@ fun DeviceScreen(vm: MonitorViewModel) {
                 Button(onClick = { vm.testVehicleSpeaker() }) { Text("Test speaker") }
                 OutlinedButton(onClick = { vm.testDeviceMic() }) { Text("Test mic") }
             }
-            NightVisionRow(ui.nightVisionOn) { vm.setNightVision(it) }
+            AutoSceneRow(ui)
+            OutlinedButton(onClick = { vm.setSceneAuto() }) { Text("Restore auto lighting") }
             Text(
                 "Plug a 4 ohm or 8 ohm speaker into the board SPK connector.",
                 style = MaterialTheme.typography.bodySmall,

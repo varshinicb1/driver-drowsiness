@@ -48,40 +48,62 @@ class LandmarkPerceptionEngine(
     private val leftIdx = intArrayOf(33,160,158,133,153,144)
     private val rightIdx = intArrayOf(362,385,387,263,373,380)
 
-    fun getEyeFeatures(landmarks: List<Point2D>): EyeFeatures {
+    fun process(
+        landmarks: List<Point2D>,
+        timestampMs: Long,
+        faceConfidence: Float = 0.95f,
+        earTh: Float = earClosedThreshold,
+        marTh: Float = marYawnThreshold,
+    ): PerceptionFrame {
+        val eye = eyeFeatures(landmarks, earTh)
+        val mouth = mouthFeatures(landmarks, marTh)
+        val hp = getHeadPose(landmarks)
+        val gaze = getGaze(landmarks)
+        return PerceptionFrame(
+            true, faceConfidence, faceConfidence, faceConfidence,
+            eye, mouth, hp, gaze, timestampMs,
+            leftEye = eye.copy(earMean = eye.earLeft),
+            rightEye = eye.copy(earMean = eye.earRight),
+        )
+    }
+
+    private fun eyeFeatures(landmarks: List<Point2D>, earTh: Float): EyeFeatures {
         if (landmarks.size >= 468) {
             try {
                 val left = leftIdx.map { landmarks[it] }
                 val right = rightIdx.map { landmarks[it] }
-                val earL = eyeAspectRatio(left); val earR = eyeAspectRatio(right)
-                val earM = (earL + earR)/2f
-                return EyeFeatures(earL, earR, earM, earM < earClosedThreshold, if (earM < earClosedThreshold) 1f else 0f)
+                val earL = eyeAspectRatio(left)
+                val earR = eyeAspectRatio(right)
+                val earM = (earL + earR) / 2f
+                return EyeFeatures(earL, earR, earM, earM < earTh, if (earM < earTh) 1f else 0f)
             } catch (_: Exception) {}
         }
-        return EyeFeatures(0f,0f,0f,false,0f)
+        return EyeFeatures(0f, 0f, 0f, false, 0f)
     }
-    fun getMouthFeatures(landmarks: List<Point2D>): MouthFeatures {
+
+    private fun mouthFeatures(landmarks: List<Point2D>, marTh: Float): MouthFeatures {
         if (landmarks.size >= 468) {
             try {
                 val h = hypot((landmarks[61].x - landmarks[291].x).toDouble(), (landmarks[61].y - landmarks[291].y).toDouble()).toFloat()
                 val v = hypot((landmarks[13].x - landmarks[14].x).toDouble(), (landmarks[13].y - landmarks[14].y).toDouble()).toFloat()
-                val mar = if (h > 1e-6f) v/h else 0f
-                return MouthFeatures(mar, mar > marYawnThreshold, mar)
+                val mar = if (h > 1e-6f) v / h else 0f
+                return MouthFeatures(mar, mar > marTh, mar)
             } catch (_: Exception) {}
         }
-        return MouthFeatures(0f,false,0f)
+        return MouthFeatures(0f, false, 0f)
     }
+
+    @Deprecated("Use process() with explicit thresholds")
+    fun getEyeFeatures(landmarks: List<Point2D>): EyeFeatures = eyeFeatures(landmarks, earClosedThreshold)
+    fun getMouthFeatures(landmarks: List<Point2D>): MouthFeatures = mouthFeatures(landmarks, marYawnThreshold)
     fun getHeadPose(landmarks: List<Point2D>) = estimateHeadPose(landmarks)
     fun getGaze(landmarks: List<Point2D>): GazeFeatures {
         val hp = estimateHeadPose(landmarks)
         val prob = (1f - (kotlin.math.abs(hp.yaw)/60f + kotlin.math.abs(hp.pitch)/60f)).coerceIn(0f,1f)
         return GazeFeatures(hp.yaw, hp.pitch, prob)
     }
-    fun process(landmarks: List<Point2D>, timestampMs: Long, faceConfidence: Float = 0.95f): PerceptionFrame {
-        val eye = getEyeFeatures(landmarks); val mouth = getMouthFeatures(landmarks)
-        val hp = getHeadPose(landmarks); val gaze = getGaze(landmarks)
-        return PerceptionFrame(true, faceConfidence, faceConfidence, faceConfidence, eye, mouth, hp, gaze, timestampMs,
-            leftEye = eye.copy(earMean = eye.earLeft), rightEye = eye.copy(earMean = eye.earRight))
-    }
-    private fun hypot(a: Double, b: Double) = kotlin.math.hypot(a,b)
+    fun process(landmarks: List<Point2D>, timestampMs: Long, faceConfidence: Float = 0.95f): PerceptionFrame =
+        process(landmarks, timestampMs, faceConfidence, earClosedThreshold, marYawnThreshold)
+
+    private fun hypot(a: Double, b: Double) = kotlin.math.hypot(a, b)
 }
